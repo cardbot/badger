@@ -203,7 +203,7 @@ func NewKV(optParam *Options) (out *KV, err error) {
 		dirLockGuard:  dirLockGuard,
 		valueDirGuard: valueDirLockGuard,
 	}
-	out.mt = skl.NewSkiplist(arenaSize(&opt))
+	out.mt = skl.NewSkiplist(uint32(arenaSize(&opt)))
 
 	// newLevelsController potentially loads files in directory.
 	if out.lc, err = newLevelsController(out); err != nil {
@@ -834,7 +834,7 @@ func (s *KV) ensureRoomForWrite() error {
 	var err error
 	s.Lock()
 	defer s.Unlock()
-	if s.mt.Size() < s.opt.MaxTableSize {
+	if int64(s.mt.Size()) < s.opt.MaxTableSize {
 		return nil
 	}
 
@@ -852,7 +852,7 @@ func (s *KV) ensureRoomForWrite() error {
 			s.mt.Size(), len(s.flushChan))
 		// We manage to push this task. Let's modify imm.
 		s.imm = append(s.imm, s.mt)
-		s.mt = skl.NewSkiplist(arenaSize(&s.opt))
+		s.mt = skl.NewSkiplist(uint32(arenaSize(&s.opt)))
 		// New memtable is empty. We certainly have room.
 		return nil
 	default:

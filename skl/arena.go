@@ -1,5 +1,6 @@
 /*
  * Copyright 2017 Dgraph Labs, Inc. and Contributors
+ * Modifications copyright (C) 2016 Andrew Kimball.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,94 +18,89 @@
 package skl
 
 import (
-	"log"
+	"errors"
 	"sync/atomic"
-
 	"unsafe"
-
-	"github.com/dgraph-io/badger/y"
-	"github.com/pkg/errors"
 )
 
 // Arena should be lock-free.
 type Arena struct {
-	n   uint32
-	buf []byte
+	size uint32
+	buf  []byte
 }
 
-// NewArena returns a new arena.
-func NewArena(n int64) *Arena {
+const (
+	kSizeSize    = uint32(unsafe.Sizeof(uint32(0)))
+)
+
+var (
+	ErrArenaFull = errors.New("allocation failed because arena is full")
+)
+
+// NewArena allocates a new arena of the specified size and returns it.
+func NewArena(size uint32) *Arena {
 	out := &Arena{
-		buf: make([]byte, n),
+		buf: make([]byte, size),
 	}
+
 	return out
 }
 
-func (s *Arena) Size() int64 {
-	return int64(atomic.LoadUint32(&s.n))
+func (a *Arena) Size() uint32 {
+	return atomic.LoadUint32(&a.size)
 }
 
-func (s *Arena) Reset() {
-	atomic.StoreUint32(&s.n, 0)
+func (a *Arena) Reset() {
+	atomic.StoreUint32(&a.size, 0)
 }
 
-func (s *Arena) Alloc(size uint32) uint32 {
-	n := atomic.AddUint32(&s.n, size)
-	if int(n) > len(s.buf) {
-		format := "Arena too small, toWrite:%d newTotal:%d limit:%d"
-		log.Fatalf("%+v", errors.Errorf(format, size, n, len(s.buf)))
+func (a *Arena) Alloc(size uint32) (uint32, error) {
+	// The actual size of the allocation includes prepended size bytes.
+	actual := size + kSizeSize
 
+	newSize := atomic.AddUint32(&a.size, actual)
+	if int(newSize) > len(a.buf) {
+		return 0, ErrArenaFull
 	}
 
-	return n - size
+	offset := newSize - size
+
+	// Write the size bytes just before the offset.
+	*(*uint32)(unsafe.Pointer(&a.buf[offset-kSizeSize])) = size
+
+	// Return offset to value portion of the allocation.
+	return offset, nil
 }
 
-func (s *Arena) GetBytes(offset, size uint32) []byte {
-	return s.buf[offset : offset+size]
+func (a *Arena) GetBytes(offset uint32) []byte {
+	if offset == 0 {
+		return nil
+	}
+
+	size := *(*uint32)(unsafe.Pointer(&a.buf[offset-kSizeSize]))
+	return a.buf[offset : offset+size]
 }
 
-func (s *Arena) GetPointer(offset uint32) unsafe.Pointer {
-	return unsafe.Pointer(&s.buf[offset])
+func (a *Arena) GetSizeBytes(offset, size uint32) []byte {
+	if offset == 0 {
+		return nil
+	}
+
+	return a.buf[offset : offset+size]
 }
 
-func (s *Arena) GetOffsetOf(ptr unsafe.Pointer) uint32 {
-	return uint32(uintptr(ptr) - uintptr(unsafe.Pointer(&s.buf[0])))
+func (a *Arena) GetPointer(offset uint32) unsafe.Pointer {
+	if offset == 0 {
+		return nil
+	}
+
+	return unsafe.Pointer(&a.buf[offset])
 }
 
-// Put will *copy* val into arena. To make better use of this, reuse your input
-// val buffer. Returns an offset into buf. User is responsible for remembering
-// size of val. We could also store this size inside arena but the encoding and
-// decoding will incur some overhead.
-func (s *Arena) PutVal(v y.ValueStruct) uint32 {
-	l := uint32(v.EncodedSize())
-	n := atomic.AddUint32(&s.n, l)
-	y.AssertTruef(int(n) <= len(s.buf),
-		"Arena too small, toWrite:%d newTotal:%d limit:%d",
-		l, n, len(s.buf))
-	m := n - l
-	v.Encode(s.buf[m:])
-	return m
-}
+func (a *Arena) GetOffsetOf(ptr unsafe.Pointer) uint32 {
+	if ptr == nil {
+		return 0
+	}
 
-func (s *Arena) PutKey(key []byte) uint32 {
-	l := uint32(len(key))
-	n := atomic.AddUint32(&s.n, l)
-	y.AssertTruef(int(n) <= len(s.buf),
-		"Arena too small, toWrite:%d newTotal:%d limit:%d",
-		l, n, len(s.buf))
-	m := n - l
-	y.AssertTrue(len(key) == copy(s.buf[m:n], key))
-	return m
-}
-
-// GetKey returns byte slice at offset.
-func (s *Arena) GetKey(offset uint32, size uint16) []byte {
-	return s.buf[offset : offset+uint32(size)]
-}
-
-// GetVal returns byte slice at offset. The given size should be just the value
-// size and should NOT include the meta bytes.
-func (s *Arena) GetVal(offset uint32) (ret y.ValueStruct) {
-	ret.Decode(s.buf[offset:])
-	return
+	return uint32(uintptr(ptr) - uintptr(unsafe.Pointer(&a.buf[0])))
 }
