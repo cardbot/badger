@@ -49,17 +49,11 @@ const (
 )
 
 type node struct {
-	// ONLY guards valueOffset, valueSize. To do without lock, we need to encode
-	// valueSize in arena. Consider this next time.
-	// RWMutex takes 24 bytes whereas Mutex takes 8 bytes.
-	sync.Mutex
-
 	// A byte slice is 24 bytes. We are trying to save space here.
 	keyOffset uint32 // Immutable. No need to lock to access key.
 	keySize   uint16 // Immutable. No need to lock to access key.
 
 	valueOffset uint32
-	valueSize   uint16 // Assume values not too big. There's value threshold.
 
 	// []*node. Size is <=kMaxNumLevels. Usually a very small array. CAS.
 	// No need to lock.
@@ -121,7 +115,6 @@ func newNode(arena *Arena, key []byte, v y.ValueStruct, height int) *node {
 		keyOffset:   keyOffset,
 		keySize:     uint16(len(key)),
 		valueOffset: valOffset,
-		valueSize:   uint16(len(v.Value)),
 		next:        make([]unsafe.Pointer, height),
 	}
 }
@@ -137,10 +130,8 @@ func NewSkiplist(arenaSize int64) *Skiplist {
 	}
 }
 
-func (s *node) getValueOffset() (uint32, uint16) {
-	s.Lock()
-	defer s.Unlock()
-	return s.valueOffset, s.valueSize
+func (s *node) getValueOffset() uint32 {
+	return atomic.LoadUint32(&s.valueOffset)
 }
 
 func (s *node) key(arena *Arena) []byte {
@@ -149,10 +140,7 @@ func (s *node) key(arena *Arena) []byte {
 
 func (s *node) setValue(arena *Arena, v y.ValueStruct) {
 	valOffset := arena.PutVal(v)
-	s.Lock()
-	defer s.Unlock()
-	s.valueOffset = valOffset
-	s.valueSize = uint16(len(v.Value))
+	atomic.StoreUint32(&s.valueOffset, valOffset)
 }
 
 func (s *node) getNext(h int) *node {
@@ -371,8 +359,7 @@ func (s *Skiplist) Get(key []byte) y.ValueStruct {
 	if !found {
 		return y.ValueStruct{}
 	}
-	valOffset, valSize := n.getValueOffset()
-	return s.arena.GetVal(valOffset, valSize)
+	return s.arena.GetVal(n.getValueOffset())
 }
 
 func (s *Skiplist) NewIterator() *Iterator {
@@ -404,8 +391,7 @@ func (s *Iterator) Key() []byte {
 
 // Value returns value.
 func (s *Iterator) Value() y.ValueStruct {
-	valOffset, valSize := s.n.getValueOffset()
-	return s.list.arena.GetVal(valOffset, valSize)
+	return s.list.arena.GetVal(s.n.getValueOffset())
 }
 
 // Next advances to the next position.

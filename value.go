@@ -49,7 +49,6 @@ const (
 )
 
 var Corrupt error = errors.New("Unable to find log. Potential data corruption.")
-var CasMismatch error = errors.New("CompareAndSet failed due to counter mismatch.")
 var KeyExists error = errors.New("SetIfAbsent failed since key already exists.")
 
 type logFile struct {
@@ -163,9 +162,6 @@ func (f *logFile) iterate(offset uint32, fn logEntry) error {
 			}
 
 			e.Meta = h.meta
-			e.UserMeta = h.userMeta
-			e.casCounter = h.casCounter
-			e.CASCounterCheck = h.casCounterCheck
 			e.Key = decompressed[:h.klen]
 			e.Value = decompressed[h.klen:]
 
@@ -184,9 +180,6 @@ func (f *logFile) iterate(offset uint32, fn logEntry) error {
 				return err
 			}
 			e.Meta = h.meta
-			e.UserMeta = h.userMeta
-			e.casCounter = h.casCounter
-			e.CASCounterCheck = h.casCounterCheck
 			if err = read(reader, e.Value); err != nil {
 				return err
 			}
@@ -258,12 +251,10 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 			ne := new(Entry)
 			y.AssertTruef(e.Meta&^BitCompressed == 0, "Got meta: %v", e.Meta)
 			ne.Meta = e.Meta & (^BitCompressed)
-			ne.UserMeta = e.UserMeta
 			ne.Key = make([]byte, len(e.Key))
 			copy(ne.Key, e.Key)
 			ne.Value = make([]byte, len(e.Value))
 			copy(ne.Value, e.Value)
-			ne.CASCounterCheck = vs.CASCounter // CAS counter check. Do not rewrite if key has a newer value.
 			wb = append(wb, ne)
 			size += int64(vlog.opt.estimateSize(ne))
 			if size >= 64*M {
@@ -316,20 +307,15 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 	return os.Remove(rem)
 }
 
-// Entry provides Key, Value and if required, CASCounterCheck to kv.BatchSet() API.
-// If CASCounterCheck is provided, it would be compared against the current casCounter
-// assigned to this key-value. Set be done on this key only if the counters match.
+// Entry provides Key, Value to kv.BatchSet() API.
 type Entry struct {
-	Key             []byte
-	Meta            byte
-	UserMeta        byte
-	Value           []byte
-	CASCounterCheck uint64 // If nonzero, we will check if existing casCounter matches.
-	Error           error  // Error if any.
+	Key   []byte
+	Meta  byte
+	Value []byte
+	Error error // Error if any.
 
 	// Fields maintained internally.
-	offset     uint32
-	casCounter uint64
+	offset uint32
 }
 
 type entryEncoder struct {
@@ -361,9 +347,6 @@ func (enc *entryEncoder) Encode(e *Entry, buf *bytes.Buffer) (int, error) {
 			h.klen = uint32(len(e.Key))
 			h.vlen = uint32(len(enc.compressed))
 			h.meta = e.Meta | BitCompressed
-			h.userMeta = e.UserMeta
-			h.casCounter = e.casCounter
-			h.casCounterCheck = e.CASCounterCheck
 			h.Encode(headerEnc[:])
 
 			buf.Write(headerEnc[:])
@@ -375,9 +358,6 @@ func (enc *entryEncoder) Encode(e *Entry, buf *bytes.Buffer) (int, error) {
 	h.klen = uint32(len(e.Key))
 	h.vlen = uint32(len(e.Value))
 	h.meta = e.Meta
-	h.userMeta = e.UserMeta
-	h.casCounter = e.casCounter
-	h.casCounterCheck = e.CASCounterCheck
 	h.Encode(headerEnc[:])
 
 	buf.Write(headerEnc[:])
@@ -387,17 +367,14 @@ func (enc *entryEncoder) Encode(e *Entry, buf *bytes.Buffer) (int, error) {
 }
 
 func (e Entry) print(prefix string) {
-	fmt.Printf("%s Key: %s Meta: %d UserMeta: %d Offset: %d len(val)=%d cas=%d check=%d\n",
-		prefix, e.Key, e.Meta, e.UserMeta, e.offset, len(e.Value), e.casCounter, e.CASCounterCheck)
+	fmt.Printf("%s Key: %s Meta: %d Offset: %d len(val)=%d",
+		prefix, e.Key, e.Meta, e.offset, len(e.Value))
 }
 
 type header struct {
-	klen            uint32
-	vlen            uint32 // len of value or length of compressed kv if entry stored compressed
-	meta            byte
-	userMeta        byte
-	casCounter      uint64
-	casCounterCheck uint64
+	klen uint32
+	vlen uint32 // len of value or length of compressed kv if entry stored compressed
+	meta byte
 }
 
 const (
@@ -409,9 +386,6 @@ func (h header) Encode(out []byte) {
 	binary.BigEndian.PutUint32(out[0:4], h.klen)
 	binary.BigEndian.PutUint32(out[4:8], h.vlen)
 	out[8] = h.meta
-	out[9] = h.userMeta
-	binary.BigEndian.PutUint64(out[10:18], h.casCounter)
-	binary.BigEndian.PutUint64(out[18:26], h.casCounterCheck)
 }
 
 // Decodes h from buf. Returns buf without header and number of bytes read.
@@ -419,9 +393,6 @@ func (h *header) Decode(buf []byte) ([]byte, int) {
 	h.klen = binary.BigEndian.Uint32(buf[0:4])
 	h.vlen = binary.BigEndian.Uint32(buf[4:8])
 	h.meta = buf[8]
-	h.userMeta = buf[9]
-	h.casCounter = binary.BigEndian.Uint64(buf[10:18])
-	h.casCounterCheck = binary.BigEndian.Uint64(buf[18:26])
 	return buf[26:], 26
 }
 
@@ -762,9 +733,6 @@ func (l *valueLog) Read(p valuePointer, s *y.Slice) (e Entry, err error) {
 	}
 	e.Key = buf[0:h.klen]
 	e.Meta = h.meta
-	e.UserMeta = h.userMeta
-	e.casCounter = h.casCounter
-	e.CASCounterCheck = h.casCounterCheck
 	e.Value = buf[h.klen : h.klen+h.vlen]
 	return e, nil
 }
@@ -882,12 +850,6 @@ func (vlog *valueLog) doRunGC() error {
 				return errStop
 			}
 			ne.offset = vp.Offset
-			if ne.casCounter == e.casCounter {
-				ne.print("Latest Entry in LSM")
-				e.print("Latest Entry in Log")
-				return errors.Errorf(
-					"This shouldn't happen. Latest Pointer:%+v. Meta:%v.", vp, vs.Meta)
-			}
 		}
 		return nil
 	})

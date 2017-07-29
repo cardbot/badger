@@ -43,7 +43,7 @@ var bufPool = sync.Pool{
 type header struct {
 	plen uint16 // Overlap with base key.
 	klen uint16 // Length of the diff.
-	vlen uint16 // Length of value.
+	vlen uint32 // Length of value.
 	prev uint32 // Offset for the previous key-value pair. The offset is relative to block base offset.
 }
 
@@ -51,21 +51,21 @@ type header struct {
 func (h header) Encode(b []byte) {
 	binary.BigEndian.PutUint16(b[0:2], h.plen)
 	binary.BigEndian.PutUint16(b[2:4], h.klen)
-	binary.BigEndian.PutUint16(b[4:6], h.vlen)
-	binary.BigEndian.PutUint32(b[6:10], h.prev)
+	binary.BigEndian.PutUint32(b[4:8], h.vlen)
+	binary.BigEndian.PutUint32(b[8:12], h.prev)
 }
 
 // Decode decodes the header.
 func (h *header) Decode(buf []byte) int {
 	h.plen = binary.BigEndian.Uint16(buf[0:2])
 	h.klen = binary.BigEndian.Uint16(buf[2:4])
-	h.vlen = binary.BigEndian.Uint16(buf[4:6])
-	h.prev = binary.BigEndian.Uint32(buf[6:10])
+	h.vlen = binary.BigEndian.Uint32(buf[4:8])
+	h.prev = binary.BigEndian.Uint32(buf[8:12])
 	return h.Size()
 }
 
 // Size returns size of the header. Currently it's just a constant.
-func (h header) Size() int { return 10 }
+func (h header) Size() int { return 12 }
 
 type TableBuilder struct {
 	counter int // Number of keys written for the current block.
@@ -136,22 +136,22 @@ func (b *TableBuilder) addHelper(key []byte, v y.ValueStruct) {
 	h := header{
 		plen: uint16(len(key) - len(diffKey)),
 		klen: uint16(len(diffKey)),
-		vlen: uint16(len(v.Value) + y.MetaSize + y.UserMetaSize + y.CasSize),
+		vlen: uint32(len(v.Value) + y.MetaSize + y.SizeSize),
 		prev: b.prevOffset, // prevOffset is the location of the last key-value added.
 	}
 	b.prevOffset = uint32(b.buf.Len()) - b.baseOffset // Remember current offset for the next Add call.
 
 	// Layout: header, diffKey, value.
-	var hbuf [10]byte
+	var hbuf [12]byte
 	h.Encode(hbuf[:])
 	b.buf.Write(hbuf[:])
 	b.buf.Write(diffKey)    // We only need to store the key difference.
 	b.buf.WriteByte(v.Meta) // Meta byte precedes actual value.
-	b.buf.WriteByte(v.UserMeta)
-	var casBytes [y.CasSize]byte
-	binary.BigEndian.PutUint64(casBytes[:], v.CASCounter)
-	b.buf.Write(casBytes[:])
+	var sizeBytes [y.SizeSize]byte
+	binary.BigEndian.PutUint32(sizeBytes[:], uint32(len(v.Value)))
+	b.buf.Write(sizeBytes[:])
 	b.buf.Write(v.Value)
+
 	b.counter++ // Increment number of keys added for this current block.
 }
 

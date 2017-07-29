@@ -35,7 +35,7 @@ func Example() {
 
 	key := []byte("hello")
 
-	kv.Set(key, []byte("world"), 0x00)
+	kv.Set(key, []byte("world"))
 	fmt.Printf("SET %s world\n", key)
 
 	var item badger.KVItem
@@ -44,25 +44,9 @@ func Example() {
 	}
 	fmt.Printf("GET %s %s\n", key, item.Value())
 
-	if err := kv.CompareAndSet(key, []byte("venus"), 100); err != nil {
-		fmt.Println("CAS counter mismatch")
-	} else {
-		if err = kv.Get(key, &item); err != nil {
-			fmt.Printf("Error while getting key: %q", key)
-		}
-		fmt.Printf("Set to %s\n", item.Value())
-	}
-	if err := kv.CompareAndSet(key, []byte("mars"), item.Counter()); err == nil {
-		fmt.Println("Set to mars")
-	} else {
-		fmt.Printf("Unsuccessful write. Got error: %v\n", err)
-	}
-
 	// Output:
 	// SET hello world
 	// GET hello world
-	// CAS counter mismatch
-	// Set to mars
 }
 
 // func ExampleNewIterator() {

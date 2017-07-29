@@ -37,18 +37,14 @@ func TestValueBasic(t *testing.T) {
 	log := &kv.vlog
 
 	entry := &Entry{
-		Key:             []byte("samplekey"),
-		Value:           []byte("sampleval"),
-		Meta:            BitValuePointer,
-		CASCounterCheck: 22222,
-		casCounter:      33333,
+		Key:   []byte("samplekey"),
+		Value: []byte("sampleval"),
+		Meta:  BitValuePointer,
 	}
 	entry2 := &Entry{
-		Key:             []byte("samplekeyb"),
-		Value:           []byte("samplevalb"),
-		Meta:            BitValuePointer,
-		CASCounterCheck: 22225,
-		casCounter:      33335,
+		Key:   []byte("samplekeyb"),
+		Value: []byte("samplevalb"),
+		Meta:  BitValuePointer,
 	}
 
 	b := new(request)
@@ -65,18 +61,14 @@ func TestValueBasic(t *testing.T) {
 	readEntries := []Entry{e, e2}
 	require.EqualValues(t, []Entry{
 		{
-			Key:             []byte("samplekey"),
-			Value:           []byte("sampleval"),
-			Meta:            BitValuePointer,
-			CASCounterCheck: 22222,
-			casCounter:      33333,
+			Key:   []byte("samplekey"),
+			Value: []byte("sampleval"),
+			Meta:  BitValuePointer,
 		},
 		{
-			Key:             []byte("samplekeyb"),
-			Value:           []byte("samplevalb"),
-			Meta:            BitValuePointer,
-			CASCounterCheck: 22225,
-			casCounter:      33335,
+			Key:   []byte("samplekeyb"),
+			Value: []byte("samplevalb"),
+			Meta:  BitValuePointer,
 		},
 	}, readEntries)
 }
@@ -94,25 +86,19 @@ func TestCompression(t *testing.T) {
 	log := &kv.vlog
 
 	entry := &Entry{
-		Key:             []byte("key1"),
-		Value:           []byte("shortval"),
-		Meta:            BitValuePointer,
-		CASCounterCheck: 22222,
-		casCounter:      33333,
+		Key:   []byte("key1"),
+		Value: []byte("shortval"),
+		Meta:  BitValuePointer,
 	}
 	entry2 := &Entry{ // This entry will be compressed
-		Key:             []byte("aaaaaaaaaaaaaaaaaaaaaaaaaa"),
-		Value:           []byte("aaaaaaaaaaaaaaaaaaaaaaaaaa"),
-		Meta:            BitValuePointer,
-		CASCounterCheck: 22225,
-		casCounter:      33335,
+		Key:   []byte("aaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		Value: []byte("aaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		Meta:  BitValuePointer,
 	}
 	entry3 := &Entry{
-		Key:             []byte("highentropy"),
-		Value:           []byte("uncompressable"),
-		Meta:            BitValuePointer,
-		CASCounterCheck: 22226,
-		casCounter:      33336,
+		Key:   []byte("highentropy"),
+		Value: []byte("uncompressable"),
+		Meta:  BitValuePointer,
 	}
 
 	b := new(request)

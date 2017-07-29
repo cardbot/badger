@@ -25,9 +25,8 @@ import (
 
 // Constants used in serialization sizes, and in ValueStruct serialization
 const (
-	MetaSize     = 1
-	UserMetaSize = 1
-	CasSize      = 8
+	MetaSize = 1
+	SizeSize = 4
 )
 
 var (

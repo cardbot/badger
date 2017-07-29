@@ -79,7 +79,7 @@ func TestConcurrentWrite(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < m; j++ {
 				kv.Set([]byte(fmt.Sprintf("k%05d_%08d", i, j)),
-					[]byte(fmt.Sprintf("v%05d_%08d", i, j)), byte(j%127))
+					[]byte(fmt.Sprintf("v%05d_%08d", i, j)))
 			}
 		}(i)
 	}
@@ -105,7 +105,6 @@ func TestConcurrentWrite(t *testing.T) {
 		require.EqualValues(t, fmt.Sprintf("k%05d_%08d", i, j), string(k))
 		v := item.Value()
 		require.EqualValues(t, fmt.Sprintf("v%05d_%08d", i, j), string(v))
-		require.Equal(t, item.UserMeta(), byte(j%127))
 		j++
 		if j == m {
 			i++
@@ -145,66 +144,6 @@ func TestCAS(t *testing.T) {
 			t.Error(err)
 		}
 		require.EqualValues(t, v, item.Value())
-		require.EqualValues(t, entries[i].casCounter, item.Counter())
-	}
-
-	for i := 0; i < 100; i++ {
-		k := []byte(fmt.Sprintf("key%d", i))
-		v := []byte(fmt.Sprintf("zzz%d", i))
-		cc := entries[i].casCounter
-		if cc == 5 {
-			cc = 6
-		} else {
-			cc = 5
-		}
-		require.Error(t, kv.CompareAndSet(k, v, cc))
-	}
-	time.Sleep(time.Second)
-	for i := 0; i < 100; i++ {
-		k := []byte(fmt.Sprintf("key%d", i))
-		v := []byte(fmt.Sprintf("val%d", i))
-		if err := kv.Get(k, &item); err != nil {
-			t.Error(err)
-		}
-		require.EqualValues(t, v, item.Value())
-		require.EqualValues(t, entries[i].casCounter, item.Counter())
-	}
-
-	for i := 0; i < 100; i++ {
-		k := []byte(fmt.Sprintf("key%d", i))
-		cc := entries[i].casCounter
-		if cc == 5 {
-			cc = 6
-		} else {
-			cc = 5
-		}
-		require.Error(t, kv.CompareAndDelete(k, cc))
-	}
-	time.Sleep(time.Second)
-	for i := 0; i < 100; i++ {
-		k := []byte(fmt.Sprintf("key%d", i))
-		v := []byte(fmt.Sprintf("val%d", i))
-		if err := kv.Get(k, &item); err != nil {
-			t.Error(err)
-		}
-		require.EqualValues(t, v, item.Value())
-		require.EqualValues(t, entries[i].casCounter, item.Counter())
-	}
-
-	for i := 0; i < 100; i++ {
-		k := []byte(fmt.Sprintf("key%d", i))
-		v := []byte(fmt.Sprintf("zzz%d", i))
-		require.NoError(t, kv.CompareAndSet(k, v, entries[i].casCounter))
-	}
-	time.Sleep(time.Second)
-	for i := 0; i < 100; i++ {
-		k := []byte(fmt.Sprintf("key%d", i))
-		v := []byte(fmt.Sprintf("zzz%d", i)) // Value should be changed.
-		if err := kv.Get(k, &item); err != nil {
-			t.Error(err)
-		}
-		require.EqualValues(t, v, item.Value())
-		require.True(t, item.Counter() != 0)
 	}
 }
 
@@ -219,45 +158,37 @@ func TestGet(t *testing.T) {
 	defer kv.Close()
 
 	var item KVItem
-	kv.Set([]byte("key1"), []byte("val1"), 0x08)
+	kv.Set([]byte("key1"), []byte("val1"))
 
 	if err := kv.Get([]byte("key1"), &item); err != nil {
 		t.Error(err)
 	}
 	require.EqualValues(t, "val1", item.Value())
-	require.Equal(t, byte(0x08), item.UserMeta())
-	require.True(t, item.Counter() != 0)
 
-	kv.Set([]byte("key1"), []byte("val2"), 0x09)
+	kv.Set([]byte("key1"), []byte("val2"))
 	if err := kv.Get([]byte("key1"), &item); err != nil {
 		t.Error(err)
 	}
 	require.EqualValues(t, "val2", item.Value())
-	require.Equal(t, byte(0x09), item.UserMeta())
-	require.True(t, item.Counter() != 0)
 
 	kv.Delete([]byte("key1"))
 	if err := kv.Get([]byte("key1"), &item); err != nil {
 		t.Error(err)
 	}
 	require.Nil(t, item.Value())
-	require.True(t, item.Counter() != 0)
 
-	kv.Set([]byte("key1"), []byte("val3"), 0x01)
+	kv.Set([]byte("key1"), []byte("val3"))
 	if err := kv.Get([]byte("key1"), &item); err != nil {
 		t.Error(err)
 	}
 	require.EqualValues(t, "val3", item.Value())
-	require.Equal(t, byte(0x01), item.UserMeta())
-	require.True(t, item.Counter() != 0)
 
 	longVal := make([]byte, 1000)
-	kv.Set([]byte("key1"), longVal, 0x00)
+	kv.Set([]byte("key1"), longVal)
 	if err := kv.Get([]byte("key1"), &item); err != nil {
 		t.Error(err)
 	}
 	require.EqualValues(t, longVal, item.Value())
-	require.True(t, item.Counter() != 0)
 }
 
 func TestExists(t *testing.T) {
@@ -271,7 +202,7 @@ func TestExists(t *testing.T) {
 	defer kv.Close()
 
 	// populate with one entry
-	err = kv.Set([]byte("key1"), []byte("val1"), 0x00)
+	err = kv.Set([]byte("key1"), []byte("val1"))
 	require.NoError(t, err)
 
 	tt := []struct {
@@ -515,7 +446,7 @@ func TestIterate2Basic(t *testing.T) {
 		if (i % 1000) == 0 {
 			t.Logf("Put i=%d\n", i)
 		}
-		kv.Set(bkey(i), bval(i), byte(i%127))
+		kv.Set(bkey(i), bval(i))
 	}
 
 	opt := IteratorOptions{}
@@ -541,7 +472,6 @@ func TestIterate2Basic(t *testing.T) {
 			require.EqualValues(t, bkey(count), string(key))
 			val := item.Value()
 			require.EqualValues(t, bval(count), string(val))
-			require.Equal(t, byte(count%127), item.UserMeta())
 			count++
 		}
 		require.EqualValues(t, n, count)
@@ -574,7 +504,7 @@ func TestLoad(t *testing.T) {
 				fmt.Printf("Putting i=%d\n", i)
 			}
 			k := []byte(fmt.Sprintf("%09d", i))
-			kv.Set(k, k, 0x00)
+			kv.Set(k, k)
 		}
 		kv.Close()
 	}
@@ -622,8 +552,8 @@ func TestIterateDeleted(t *testing.T) {
 	ps, err := NewKV(&opt)
 	require.NoError(t, err)
 	defer ps.Close()
-	ps.Set([]byte("Key1"), []byte("Value1"), 0x00)
-	ps.Set([]byte("Key2"), []byte("Value2"), 0x00)
+	ps.Set([]byte("Key1"), []byte("Value1"))
+	ps.Set([]byte("Key2"), []byte("Value2"))
 
 	iterOpt := DefaultIteratorOptions
 	iterOpt.FetchValues = false
@@ -687,7 +617,7 @@ func TestDeleteWithoutSyncWrite(t *testing.T) {
 
 	key := []byte("k1")
 	// Set a value with size > value threshold so that its written to value log.
-	require.NoError(t, kv.Set(key, []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789FOOBARZOGZOG"), 0x00))
+	require.NoError(t, kv.Set(key, []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789FOOBARZOGZOG")))
 	require.NoError(t, kv.Delete(key))
 	kv.Close()
 
@@ -711,10 +641,10 @@ func TestSetIfAbsent(t *testing.T) {
 	require.NoError(t, err)
 
 	key := []byte("k1")
-	err = kv.SetIfAbsent(key, []byte("val"), 0x00)
+	err = kv.SetIfAbsent(key, []byte("val"))
 	require.NoError(t, err)
 
-	err = kv.SetIfAbsent(key, []byte("val2"), 0x00)
+	err = kv.SetIfAbsent(key, []byte("val2"))
 	require.EqualError(t, err, KeyExists.Error())
 }
 

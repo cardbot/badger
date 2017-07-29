@@ -26,15 +26,13 @@ import (
 // KVItem is returned during iteration. Both the Key() and Value() output is only valid until
 // iterator.Next() is called.
 type KVItem struct {
-	wg         sync.WaitGroup
-	key        []byte
-	vptr       []byte
-	meta       byte
-	userMeta   byte
-	val        []byte
-	casCounter uint64
-	slice      *y.Slice
-	next       *KVItem
+	wg    sync.WaitGroup
+	key   []byte
+	vptr  []byte
+	meta  byte
+	val   []byte
+	slice *y.Slice
+	next  *KVItem
 }
 
 // Key returns the key. Remember to copy if you need to access it outside the iteration loop.
@@ -48,16 +46,6 @@ func (item *KVItem) Key() []byte {
 func (item *KVItem) Value() []byte {
 	item.wg.Wait()
 	return item.val
-}
-
-// Counter returns the CAS counter associated with the value.
-func (item *KVItem) Counter() uint64 {
-	return item.casCounter
-}
-
-// UserMeta returns the userMeta set by the user
-func (item *KVItem) UserMeta() byte {
-	return item.userMeta
 }
 
 type list struct {
@@ -171,8 +159,6 @@ func (it *Iterator) Next() {
 func (it *Iterator) fill(item *KVItem) {
 	vs := it.iitr.Value()
 	item.meta = vs.Meta
-	item.userMeta = vs.UserMeta
-	item.casCounter = vs.CASCounter
 	item.key = y.Safecopy(item.key, it.iitr.Key())
 	item.vptr = y.Safecopy(item.vptr, vs.Value)
 	if it.opt.FetchValues {
