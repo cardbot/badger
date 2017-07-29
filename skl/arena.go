@@ -17,9 +17,13 @@
 package skl
 
 import (
+	"log"
 	"sync/atomic"
 
+	"unsafe"
+
 	"github.com/dgraph-io/badger/y"
+	"github.com/pkg/errors"
 )
 
 // Arena should be lock-free.
@@ -42,6 +46,29 @@ func (s *Arena) Size() int64 {
 
 func (s *Arena) Reset() {
 	atomic.StoreUint32(&s.n, 0)
+}
+
+func (s *Arena) Alloc(size uint32) uint32 {
+	n := atomic.AddUint32(&s.n, size)
+	if int(n) > len(s.buf) {
+		format := "Arena too small, toWrite:%d newTotal:%d limit:%d"
+		log.Fatalf("%+v", errors.Errorf(format, size, n, len(s.buf)))
+
+	}
+
+	return n - size
+}
+
+func (s *Arena) GetBytes(offset, size uint32) []byte {
+	return s.buf[offset : offset+size]
+}
+
+func (s *Arena) GetPointer(offset uint32) unsafe.Pointer {
+	return unsafe.Pointer(&s.buf[offset])
+}
+
+func (s *Arena) GetOffsetOf(ptr unsafe.Pointer) uint32 {
+	return uint32(uintptr(ptr) - uintptr(unsafe.Pointer(&s.buf[0])))
 }
 
 // Put will *copy* val into arena. To make better use of this, reuse your input

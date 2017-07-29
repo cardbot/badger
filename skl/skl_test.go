@@ -38,11 +38,11 @@ func newValue(v int) []byte {
 
 // length iterates over skiplist to give exact size.
 func length(s *Skiplist) int {
-	x := s.head.getNext(0)
+	x := s.getNext(s.head, 0)
 	count := 0
 	for x != nil {
 		count++
-		x = x.getNext(0)
+		x = s.getNext(x, 0)
 	}
 	return count
 }
