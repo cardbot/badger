@@ -27,6 +27,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"time"
+
 	"github.com/dgraph-io/badger/y"
 )
 
@@ -402,10 +404,10 @@ func TestIteratorSeek(t *testing.T) {
 	require.EqualValues(t, "01990", v.Value)
 }
 
-func randomKey() []byte {
+func randomKey(rng *rand.Rand) []byte {
 	b := make([]byte, 8)
-	key := rand.Uint32()
-	key2 := rand.Uint32()
+	key := rng.Uint32()
+	key2 := rng.Uint32()
 	binary.LittleEndian.PutUint32(b, key)
 	binary.LittleEndian.PutUint32(b[4:], key2)
 	return b
@@ -423,14 +425,15 @@ func BenchmarkReadWrite(b *testing.B) {
 			b.ResetTimer()
 			var count int
 			b.RunParallel(func(pb *testing.PB) {
+				rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 				for pb.Next() {
-					if rand.Float32() < readFrac {
-						v := l.Get(randomKey())
+					if rng.Float32() < readFrac {
+						v := l.Get(randomKey(rng))
 						if v.Value != nil {
 							count++
 						}
 					} else {
-						l.Put(randomKey(), y.ValueStruct{value, 0})
+						l.Put(randomKey(rng), y.ValueStruct{value, 0})
 					}
 				}
 			})
@@ -450,17 +453,18 @@ func BenchmarkReadWriteMap(b *testing.B) {
 			b.ResetTimer()
 			var count int
 			b.RunParallel(func(pb *testing.PB) {
+				rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 				for pb.Next() {
-					if rand.Float32() < readFrac {
+					if rng.Float32() < readFrac {
 						mutex.RLock()
-						_, ok := m[string(randomKey())]
+						_, ok := m[string(randomKey(rng))]
 						mutex.RUnlock()
 						if ok {
 							count++
 						}
 					} else {
 						mutex.Lock()
-						m[string(randomKey())] = value
+						m[string(randomKey(rng))] = value
 						mutex.Unlock()
 					}
 				}

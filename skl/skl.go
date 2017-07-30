@@ -34,7 +34,6 @@ package skl
 
 import (
 	"bytes"
-	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -45,10 +44,9 @@ import (
 )
 
 const (
-	kMaxHeight      = 20
-	kHeightIncrease = math.MaxUint32 / 3
-	kNodeSize       = int(unsafe.Sizeof(node{}))
-	kUint32Size     = 4
+	kMaxHeight  = 20
+	kNodeSize   = int(unsafe.Sizeof(node{}))
+	kUint32Size = 4
 )
 
 type node struct {
@@ -63,9 +61,8 @@ type node struct {
 	// When node is allocated, extra space is allocated after it in memory,
 	// and unsafe operations are used to access array elements. This is
 	// usually a very small array, since the probability of each successive
-	// level decreases exponentially. The size is always <= kMaxNumLevels.
-	// All accesses to elements should use CAS operations, with no need to
-	// lock.
+	// level decreases exponentially. The size is always <= kMaxHeight. All
+	// accesses to elements should use CAS operations, with no need to lock.
 	tower [1]uint32
 }
 
