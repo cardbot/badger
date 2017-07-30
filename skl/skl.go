@@ -40,7 +40,6 @@ import (
 	"unsafe"
 
 	"github.com/dgraph-io/badger/y"
-	"fmt"
 )
 
 const (
@@ -53,10 +52,11 @@ const (
 type node struct {
 	// A byte slice is 24 bytes. We are trying to save space here.
 	keyOffset uint32 // Immutable. No need to lock to access key.
-	keySize uint32
+	keySize   uint32
 
-	// The value's size is stored in the value's header.
-	valueOffset uint32
+	// The uint32 size and offset of the value are encoded as a single uint64
+	// so that it can be atomically loaded and stored.
+	value uint64
 
 	// When node is allocated, extra space is allocated after it in memory,
 	// and unsafe operations are used to access array elements. This is
@@ -93,16 +93,16 @@ func (s *Skiplist) Valid() bool { return s.arena != nil }
 
 func newNode(arena *Arena, key []byte, v y.ValueStruct, height int) (*node, error) {
 	keySize := uint32(len(key))
-	keyOffset, err := arena.Alloc(keySize)
+	keyOffset, err := arena.Alloc(keySize, Align1)
 	if err != nil {
 		return nil, err
 	}
 
-	copy(arena.GetSizeBytes(keyOffset, keySize), key)
+	copy(arena.GetBytes(keyOffset, keySize), key)
 
 	// The base level is already allocated in the node struct.
-	towerSize := kUint32Size * (height-1)
-	nodeOffset, err := arena.Alloc(uint32(kNodeSize + towerSize))
+	towerSize := kUint32Size * (height - 1)
+	nodeOffset, err := arena.Alloc(uint32(kNodeSize+towerSize), Align8)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +110,7 @@ func newNode(arena *Arena, key []byte, v y.ValueStruct, height int) (*node, erro
 	node := (*node)(arena.GetPointer(nodeOffset))
 	node.keyOffset = keyOffset
 	node.keySize = keySize
-	node.valueOffset, err = node.allocVal(arena, &v)
+	node.value, err = node.allocVal(arena, &v)
 	if err != nil {
 		return nil, err
 	}
@@ -130,27 +130,26 @@ func NewSkiplist(arenaSize uint32) *Skiplist {
 	return skl
 }
 
-func (n *node) key(arena *Arena) []byte {
-	return arena.GetSizeBytes(n.keyOffset, n.keySize)
+func (n *node) getKey(arena *Arena) []byte {
+	return arena.GetBytes(n.keyOffset, n.keySize)
 }
 
-func (n *node) value(arena *Arena) (ret y.ValueStruct) {
-	buf := arena.GetBytes(n.getValueOffset())
+func (n *node) getValue(arena *Arena) (ret y.ValueStruct) {
+	val := atomic.LoadUint64(&n.value)
+	valSize, valOffset := decodeValue(val)
+
+	buf := arena.GetBytes(valOffset, valSize)
 	ret.Decode(buf)
 	return
 }
 
-func (n *node) getValueOffset() uint32 {
-	return atomic.LoadUint32(&n.valueOffset)
-}
-
 func (n *node) setValue(arena *Arena, v *y.ValueStruct) error {
-	valOffset, err := n.allocVal(arena, v)
+	val, err := n.allocVal(arena, v)
 	if err != nil {
 		return err
 	}
 
-	atomic.StoreUint32(&n.valueOffset, valOffset)
+	atomic.StoreUint64(&n.value, val)
 	return nil
 }
 
@@ -166,23 +165,26 @@ func (n *node) unsafeTower() *[kMaxHeight]uint32 {
 	return (*[kMaxHeight]uint32)(unsafe.Pointer(&n.tower))
 }
 
-func (n *node) allocVal(arena *Arena, v *y.ValueStruct) (uint32, error) {
+func (n *node) allocVal(arena *Arena, v *y.ValueStruct) (uint64, error) {
 	valSize := uint32(v.EncodedSize())
-	valOffset, err := arena.Alloc(valSize)
+	valOffset, err := arena.Alloc(valSize, Align1)
 	if err != nil {
 		return 0, err
 	}
 
-	v.Encode(arena.GetSizeBytes(valOffset, valSize))
-	return valOffset, nil
+	v.Encode(arena.GetBytes(valOffset, valSize))
+	return encodeValue(valSize, valOffset), nil
 }
 
-// Returns true if key is strictly > n.key.
-// If n is nil, this is an "end" marker and we return false.
-//func (s *Skiplist) keyIsAfterNode(key []byte, n *node) bool {
-//	y.AssertTrue(n != s.head)
-//	return n != nil && bytes.Compare(key, n.key) > 0
-//}
+func encodeValue(valSize, valOffset uint32) uint64 {
+	return uint64(valSize)<<32 | uint64(valOffset)
+}
+
+func decodeValue(val uint64) (valSize, valOffset uint32) {
+	valSize = uint32(val >> 32)
+	valOffset = uint32(val & 0xffffffff)
+	return
+}
 
 func randomHeight() int {
 	h := 1
@@ -222,7 +224,7 @@ func (s *Skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool
 			return x, false
 		}
 
-		nextKey := next.key(s.arena)
+		nextKey := next.getKey(s.arena)
 		cmp := bytes.Compare(key, nextKey)
 		if cmp > 0 {
 			// x.key < next.key < key. We can continue to move right.
@@ -278,12 +280,7 @@ func (s *Skiplist) findSpliceForLevel(key []byte, before *node, level int) (*nod
 			return before, next
 		}
 
-		if next.keyOffset + next.keySize >= uint32(len(s.arena.buf)) {
-			fmt.Printf("%v, %v", next.keyOffset, next.keySize)
-			panic("what the????")
-		}
-
-		nextKey := next.key(s.arena)
+		nextKey := next.getKey(s.arena)
 		cmp := bytes.Compare(key, nextKey)
 		if cmp == 0 {
 			// Equality case.
@@ -350,10 +347,10 @@ func (s *Skiplist) Put(key []byte, v y.ValueStruct) error {
 				y.AssertTrue(prev[i] != next[i])
 			}
 
-			nextOffset := s.arena.GetOffsetOf(unsafe.Pointer(next[i]))
+			nextOffset := s.arena.GetPointerOffset(unsafe.Pointer(next[i]))
 			x.unsafeTower()[i] = nextOffset
 
-			if prev[i].casNextOffset(i, nextOffset, s.arena.GetOffsetOf(unsafe.Pointer(x))) {
+			if prev[i].casNextOffset(i, nextOffset, s.arena.GetPointerOffset(unsafe.Pointer(x))) {
 				// Managed to insert x between prev[i] and next[i]. Go to the next level.
 				break
 			}
@@ -402,7 +399,7 @@ func (s *Skiplist) Get(key []byte) y.ValueStruct {
 	if !found {
 		return y.ValueStruct{}
 	}
-	return n.value(s.arena)
+	return n.getValue(s.arena)
 }
 
 func (s *Skiplist) NewIterator() *Iterator {
@@ -429,12 +426,12 @@ func (s *Iterator) Valid() bool { return s.n != nil }
 
 // Key returns the key at the current position.
 func (s *Iterator) Key() []byte {
-	return s.n.key(s.list.arena)
+	return s.n.getKey(s.list.arena)
 }
 
 // Value returns value.
 func (s *Iterator) Value() y.ValueStruct {
-	return s.n.value(s.list.arena)
+	return s.n.getValue(s.list.arena)
 }
 
 // Next advances to the next position.

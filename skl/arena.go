@@ -25,12 +25,17 @@ import (
 
 // Arena should be lock-free.
 type Arena struct {
-	size uint32
-	buf  []byte
+	n   uint32
+	buf []byte
 }
 
+type Align uint8
+
 const (
-	kSizeSize    = uint32(unsafe.Sizeof(uint32(0)))
+	Align1 = 0
+	Align2 = 1
+	Align4 = 3
+	Align8 = 7
 )
 
 var (
@@ -39,7 +44,10 @@ var (
 
 // NewArena allocates a new arena of the specified size and returns it.
 func NewArena(size uint32) *Arena {
+	// Don't store data at position 0 in order to reserve offset=0 as a kind
+	// of nil pointer.
 	out := &Arena{
+		n:   1,
 		buf: make([]byte, size),
 	}
 
@@ -47,41 +55,28 @@ func NewArena(size uint32) *Arena {
 }
 
 func (a *Arena) Size() uint32 {
-	return atomic.LoadUint32(&a.size)
+	return atomic.LoadUint32(&a.n)
 }
 
 func (a *Arena) Reset() {
-	atomic.StoreUint32(&a.size, 0)
+	atomic.StoreUint32(&a.n, 1)
 }
 
-func (a *Arena) Alloc(size uint32) (uint32, error) {
-	// The actual size of the allocation includes prepended size bytes.
-	actual := size + kSizeSize
+func (a *Arena) Alloc(size uint32, align Align) (uint32, error) {
+	// Pad the allocation with enough bytes to ensure the requested alignment.
+	padded := size + uint32(align)
 
-	newSize := atomic.AddUint32(&a.size, actual)
+	newSize := atomic.AddUint32(&a.n, padded)
 	if int(newSize) > len(a.buf) {
 		return 0, ErrArenaFull
 	}
 
-	offset := newSize - size
-
-	// Write the size bytes just before the offset.
-	*(*uint32)(unsafe.Pointer(&a.buf[offset-kSizeSize])) = size
-
-	// Return offset to value portion of the allocation.
+	// Return the aligned offset.
+	offset := (newSize - padded + uint32(align)) & ^uint32(align)
 	return offset, nil
 }
 
-func (a *Arena) GetBytes(offset uint32) []byte {
-	if offset == 0 {
-		return nil
-	}
-
-	size := *(*uint32)(unsafe.Pointer(&a.buf[offset-kSizeSize]))
-	return a.buf[offset : offset+size]
-}
-
-func (a *Arena) GetSizeBytes(offset, size uint32) []byte {
+func (a *Arena) GetBytes(offset, size uint32) []byte {
 	if offset == 0 {
 		return nil
 	}
@@ -97,7 +92,7 @@ func (a *Arena) GetPointer(offset uint32) unsafe.Pointer {
 	return unsafe.Pointer(&a.buf[offset])
 }
 
-func (a *Arena) GetOffsetOf(ptr unsafe.Pointer) uint32 {
+func (a *Arena) GetPointerOffset(ptr unsafe.Pointer) uint32 {
 	if ptr == nil {
 		return 0
 	}

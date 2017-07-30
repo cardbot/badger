@@ -136,7 +136,7 @@ func (b *TableBuilder) addHelper(key []byte, v y.ValueStruct) {
 	h := header{
 		plen: uint16(len(key) - len(diffKey)),
 		klen: uint16(len(diffKey)),
-		vlen: uint32(len(v.Value) + y.MetaSize + y.SizeSize),
+		vlen: uint32(len(v.Value) + y.MetaSize),
 		prev: b.prevOffset, // prevOffset is the location of the last key-value added.
 	}
 	b.prevOffset = uint32(b.buf.Len()) - b.baseOffset // Remember current offset for the next Add call.
@@ -147,9 +147,6 @@ func (b *TableBuilder) addHelper(key []byte, v y.ValueStruct) {
 	b.buf.Write(hbuf[:])
 	b.buf.Write(diffKey)    // We only need to store the key difference.
 	b.buf.WriteByte(v.Meta) // Meta byte precedes actual value.
-	var sizeBytes [y.SizeSize]byte
-	binary.BigEndian.PutUint32(sizeBytes[:], uint32(len(v.Value)))
-	b.buf.Write(sizeBytes[:])
 	b.buf.Write(v.Value)
 
 	b.counter++ // Increment number of keys added for this current block.

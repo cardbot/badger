@@ -19,7 +19,6 @@ package y
 import (
 	"bytes"
 	"container/heap"
-	"encoding/binary"
 
 	"github.com/pkg/errors"
 )
@@ -40,21 +39,18 @@ func ValueStructSerializedSize(size uint16) int {
 
 const (
 	valueMetaOffset  = 0
-	valueSizeOffset  = valueMetaOffset + MetaSize
-	valueValueOffset = valueSizeOffset + SizeSize
+	valueValueOffset = valueMetaOffset + MetaSize
 )
 
 // DecodeEntireSlice uses the length of the slice to infer the length of the Value field.
 func (v *ValueStruct) Decode(b []byte) {
 	v.Meta = b[valueMetaOffset]
-	size := binary.BigEndian.Uint32(b[valueSizeOffset : valueSizeOffset+SizeSize])
-	v.Value = b[valueValueOffset : valueValueOffset+size]
+	v.Value = b[valueValueOffset:]
 }
 
 // Encode expects a slice of length at least v.EncodedSize().
 func (v *ValueStruct) Encode(b []byte) {
 	b[valueMetaOffset] = v.Meta
-	binary.BigEndian.PutUint32(b[valueSizeOffset:valueSizeOffset+SizeSize], uint32(len(v.Value)))
 	copy(b[valueValueOffset:valueValueOffset+len(v.Value)], v.Value)
 }
 
