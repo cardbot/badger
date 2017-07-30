@@ -36,7 +36,9 @@ import (
 	"bytes"
 	"math"
 	"math/rand"
+	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/dgraph-io/badger/y"
@@ -68,10 +70,13 @@ type node struct {
 }
 
 type Skiplist struct {
+	sync.Mutex
+
 	height int32 // Current height. 1 <= height <= kMaxHeight. CAS.
 	head   *node
 	ref    int32
 	arena  *Arena
+	rng    *rand.Rand
 }
 
 func (s *Skiplist) IncrRef() {
@@ -125,7 +130,17 @@ func NewSkiplist(arenaSize uint32) *Skiplist {
 		panic("arenaSize is not large enough to hold the head node")
 	}
 
-	skl := &Skiplist{height: 1, head: head, arena: arena, ref: 1}
+	// Use private random number generator, in order to avoid global lock used
+	// by the default rng.
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	skl := &Skiplist{
+		height: 1,
+		head:   head,
+		arena:  arena,
+		ref:    1,
+		rng:    rng,
+	}
 
 	return skl
 }
@@ -186,12 +201,11 @@ func decodeValue(val uint64) (valSize, valOffset uint32) {
 	return
 }
 
-func randomHeight() int {
-	h := 1
-	for h < kMaxHeight && rand.Uint32() <= kHeightIncrease {
-		h++
-	}
-	return h
+func (s *Skiplist) randomHeight() int {
+	s.Lock()
+	defer s.Unlock()
+
+	return randomHeight(s.rng.Float64(), kMaxHeight)
 }
 
 // findNear finds the node near to key.
@@ -317,7 +331,7 @@ func (s *Skiplist) Put(key []byte, v y.ValueStruct) error {
 	}
 
 	// We do need to create a new node.
-	height := randomHeight()
+	height := s.randomHeight()
 	x, err := newNode(s.arena, key, v, height)
 	if err != nil {
 		return err
