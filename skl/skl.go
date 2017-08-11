@@ -184,6 +184,36 @@ func (s *Skiplist) newNode(key, val []byte, meta uint16) (nd *node, height uint3
 	return
 }
 
+func (s *Skiplist) findSpliceForLevel(key []byte, level int, start *node) (prev, next *node, found bool) {
+	prev = start
+
+	for {
+		// Assume prev.key < key.
+		next = s.getNext(prev, level)
+		if next == nil {
+			break
+		}
+
+		nextKey := next.getKey(s.arena)
+		cmp := bytes.Compare(key, nextKey)
+		if cmp == 0 {
+			// Equality case.
+			found = true
+			break
+		}
+
+		if cmp < 0 {
+			// We are done for this level, since prevNode.key < key < nextNode.key.
+			break
+		}
+
+		// Keep moving right on this level.
+		prev = next
+	}
+
+	return
+}
+
 func (s *Skiplist) getNext(nd *node, h int) *node {
 	offset := nd.nextOffset(h)
 	return (*node)(s.arena.GetPointer(offset))
@@ -289,32 +319,23 @@ func (it *Iterator) Next() {
 }
 
 func (it *Iterator) Seek(key []byte) (found bool) {
-	level := int(it.list.Height() - 1)
+	var next *node
+	_, next, found = it.seekBaseSplice(key)
+	it.setNode(next)
+	return
+}
 
+func (it *Iterator) SeekPrev(key []byte) (found bool) {
 	var prev, next *node
-	prev = it.list.head
-	for {
-		prev, next, found = it.findSpliceForLevel(key, level, prev)
-		prevOffset := it.arena.GetPointerOffset(unsafe.Pointer(prev))
-
-		if found {
-			for i := level; i >= 0; i-- {
-				it.fingers[level] = prevOffset
-			}
-
-			break
-		}
-
-		it.fingers[level] = prevOffset
-
-		if level == 0 {
-			break
-		}
-
-		level--
+	prev, next, found = it.seekBaseSplice(key)
+	if found {
+		it.setNode(next)
+	} else if prev != it.list.head {
+		it.setNode(prev)
+	} else {
+		it.setNode(nil)
 	}
 
-	it.setNode(next)
 	return
 }
 
@@ -365,7 +386,7 @@ func (it *Iterator) Add(key []byte, val []byte, meta uint16) error {
 			// be helpful to try to use a different level as we redo the search,
 			// because it is unlikely that lots of nodes are inserted between prev
 			// and next.
-			prev, next, found = it.findSpliceForLevel(key, i, prev)
+			prev, next, found = it.list.findSpliceForLevel(key, i, prev)
 			if found {
 				y.AssertTruef(i == 0, "Another thread can only race at the base level")
 				return it.setValueIfDeleted(next, val, meta)
@@ -479,36 +500,6 @@ func (it *Iterator) setValueIfDeleted(nd *node, val []byte, meta uint16) error {
 	return err
 }
 
-func (it *Iterator) findSpliceForLevel(key []byte, level int, before *node) (prev, next *node, found bool) {
-	prev = before
-
-	for {
-		// Assume prev.key < key.
-		next = it.list.getNext(prev, level)
-		if next == nil {
-			break
-		}
-
-		nextKey := next.getKey(it.arena)
-		cmp := bytes.Compare(key, nextKey)
-		if cmp == 0 {
-			// Equality case.
-			found = true
-			break
-		}
-
-		if cmp < 0 {
-			// We are done for this level, since prevNode.key < key < nextNode.key.
-			break
-		}
-
-		// Keep moving right on this level.
-		prev = next
-	}
-
-	return
-}
-
 func (it *Iterator) seekForSplice(key []byte, spl *[kMaxHeight]splice) (found bool) {
 	var prev, next *node
 
@@ -527,7 +518,7 @@ func (it *Iterator) seekForSplice(key []byte, spl *[kMaxHeight]splice) (found bo
 		}
 
 		oldPrev := prev
-		prev, next, found = it.findSpliceForLevel(key, level, prev)
+		prev, next, found = it.list.findSpliceForLevel(key, level, prev)
 		spl[level].init(prev, next)
 		it.fingers[level] = it.arena.GetPointerOffset(unsafe.Pointer(prev))
 
@@ -537,6 +528,34 @@ func (it *Iterator) seekForSplice(key []byte, spl *[kMaxHeight]splice) (found bo
 		if useFingers && oldPrev != prev {
 			useFingers = false
 		}
+
+		if level == 0 {
+			break
+		}
+
+		level--
+	}
+
+	return
+}
+
+func (it *Iterator) seekBaseSplice(key []byte) (prev, next *node, found bool) {
+	level := int(it.list.Height() - 1)
+
+	prev = it.list.head
+	for {
+		prev, next, found = it.list.findSpliceForLevel(key, level, prev)
+		prevOffset := it.arena.GetPointerOffset(unsafe.Pointer(prev))
+
+		if found {
+			for i := level; i >= 0; i-- {
+				it.fingers[level] = prevOffset
+			}
+
+			break
+		}
+
+		it.fingers[level] = prevOffset
 
 		if level == 0 {
 			break

@@ -478,6 +478,49 @@ func TestIteratorSeek(t *testing.T) {
 	require.False(t, it.Valid())
 }
 
+func TestIteratorSeekPrev(t *testing.T) {
+	const n = 100
+	l := NewSkiplist(arenaSize)
+	defer l.DecrRef()
+
+	it := l.NewIterator()
+	defer it.Close()
+
+	require.False(t, it.Valid())
+	it.SeekToFirst()
+	require.False(t, it.Valid())
+	// 1000, 1010, 1020, ..., 1990.
+	for i := n - 1; i >= 0; i-- {
+		v := i*10 + 1000
+		it.Add([]byte(fmt.Sprintf("%05d", i*10+1000)), newValue(v), uint16(v))
+	}
+	it.SeekPrev([]byte(""))
+	require.False(t, it.Valid())
+
+	it.SeekPrev([]byte("00990"))
+	require.False(t, it.Valid())
+
+	it.SeekPrev([]byte("01000"))
+	require.True(t, it.Valid())
+	require.EqualValues(t, "01000", it.Value())
+	require.EqualValues(t, 1000, it.Meta())
+
+	it.SeekPrev([]byte("01005"))
+	require.True(t, it.Valid())
+	require.EqualValues(t, "01000", it.Value())
+	require.EqualValues(t, 1000, it.Meta())
+
+	it.SeekPrev([]byte("01990"))
+	require.True(t, it.Valid())
+	require.EqualValues(t, "01990", it.Value())
+	require.EqualValues(t, 1990, it.Meta())
+
+	it.SeekPrev([]byte("99999"))
+	require.True(t, it.Valid())
+	require.EqualValues(t, "01990", it.Value())
+	require.EqualValues(t, 1990, it.Meta())
+}
+
 func randomKey(rng *rand.Rand) []byte {
 	b := make([]byte, 8)
 	key := rng.Uint32()
