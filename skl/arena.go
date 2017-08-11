@@ -62,9 +62,9 @@ func (a *Arena) Reset() {
 	atomic.StoreUint32(&a.n, 1)
 }
 
-func (a *Arena) Alloc(size uint32, align Align) (uint32, error) {
+func (a *Arena) Alloc(size uint16, align Align) (uint32, error) {
 	// Pad the allocation with enough bytes to ensure the requested alignment.
-	padded := size + uint32(align)
+	padded := uint32(size) + uint32(align)
 
 	newSize := atomic.AddUint32(&a.n, padded)
 	if int(newSize) > len(a.buf) {
@@ -76,12 +76,12 @@ func (a *Arena) Alloc(size uint32, align Align) (uint32, error) {
 	return offset, nil
 }
 
-func (a *Arena) GetBytes(offset, size uint32) []byte {
+func (a *Arena) GetBytes(offset uint32, size uint16) []byte {
 	if offset == 0 {
 		return nil
 	}
 
-	return a.buf[offset : offset+size]
+	return a.buf[offset : offset+uint32(size)]
 }
 
 func (a *Arena) GetPointer(offset uint32) unsafe.Pointer {

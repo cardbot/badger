@@ -32,6 +32,8 @@ package skl
 
 import (
 	"math"
+
+	"github.com/dgraph-io/badger/y"
 )
 
 const (
@@ -57,10 +59,13 @@ func init() {
 // RandomHeight maps a random float64 value in [0.0, 1.0) to the tower height
 // that a skiplist node should use, where height <= maxHeight and maxHeight
 // is <= 64.
-func randomHeight(rnd float64, maxHeight int) int {
+func randomHeight(rnd float64, max int) int {
+	y.AssertTrue(max <= maxHeight)
+
 	height := 1
-	for height < maxHeight && rnd < probabilities[height] {
+	for height < max && rnd < probabilities[height] {
 		height++
 	}
+
 	return height
 }

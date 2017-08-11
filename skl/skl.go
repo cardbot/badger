@@ -34,6 +34,7 @@ package skl
 
 import (
 	"bytes"
+	"errors"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -45,17 +46,25 @@ import (
 
 const (
 	kMaxHeight  = 20
-	kNodeSize   = int(unsafe.Sizeof(node{}))
+	kNodeSize   = uint16(unsafe.Sizeof(node{}))
 	kUint32Size = 4
+	kDeletedVal = 0
 )
+
+var ErrRecordExists = errors.New("record with this key already exists")
+var ErrRecordUpdated = errors.New("record was updated by another caller")
+var ErrRecordDeleted = errors.New("record was deleted by another caller")
 
 type node struct {
 	// A byte slice is 24 bytes. We are trying to save space here.
 	keyOffset uint32 // Immutable. No need to lock to access key.
 	keySize   uint32
 
-	// The uint32 size and offset of the value are encoded as a single uint64
-	// so that it can be atomically loaded and stored.
+	// Multiple parts of the value are encoded as a single uint64 so that it
+	// can be atomically loaded and stored:
+	//   uint32: offset
+	//   uint16: size
+	//   uint16: meta
 	value uint64
 
 	// When node is allocated, extra space is allocated after it in memory,
@@ -69,7 +78,7 @@ type node struct {
 type Skiplist struct {
 	sync.Mutex
 
-	height int32 // Current height. 1 <= height <= kMaxHeight. CAS.
+	height uint32 // Current height. 1 <= height <= kMaxHeight. CAS.
 	head   *node
 	ref    int32
 	arena  *Arena
@@ -93,8 +102,8 @@ func (s *Skiplist) DecrRef() {
 
 func (s *Skiplist) Valid() bool { return s.arena != nil }
 
-func newNode(arena *Arena, key []byte, v y.ValueStruct, height int) (*node, error) {
-	keySize := uint32(len(key))
+func newNode(arena *Arena, key, val []byte, meta uint16, height uint32) (*node, error) {
+	keySize := uint16(len(key))
 	keyOffset, err := arena.Alloc(keySize, Align1)
 	if err != nil {
 		return nil, err
@@ -103,16 +112,16 @@ func newNode(arena *Arena, key []byte, v y.ValueStruct, height int) (*node, erro
 	copy(arena.GetBytes(keyOffset, keySize), key)
 
 	// The base level is already allocated in the node struct.
-	towerSize := kUint32Size * (height - 1)
-	nodeOffset, err := arena.Alloc(uint32(kNodeSize+towerSize), Align8)
+	towerSize := uint16(kUint32Size * (height - 1))
+	nodeOffset, err := arena.Alloc(kNodeSize+towerSize, Align8)
 	if err != nil {
 		return nil, err
 	}
 
 	node := (*node)(arena.GetPointer(nodeOffset))
 	node.keyOffset = keyOffset
-	node.keySize = keySize
-	node.value, err = node.allocVal(arena, &v)
+	node.keySize = uint32(keySize)
+	node.value, err = node.allocVal(arena, val, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +131,7 @@ func newNode(arena *Arena, key []byte, v y.ValueStruct, height int) (*node, erro
 
 func NewSkiplist(arenaSize uint32) *Skiplist {
 	arena := NewArena(arenaSize)
-	head, err := newNode(arena, nil, y.ValueStruct{}, kMaxHeight)
+	head, err := newNode(arena, nil, nil, 0, kMaxHeight)
 	if err != nil {
 		panic("arenaSize is not large enough to hold the head node")
 	}
@@ -142,27 +151,53 @@ func NewSkiplist(arenaSize uint32) *Skiplist {
 	return skl
 }
 
-func (n *node) getKey(arena *Arena) []byte {
-	return arena.GetBytes(n.keyOffset, n.keySize)
+func (s *Skiplist) Height() uint32 {
+	return atomic.LoadUint32(&s.height)
 }
 
-func (n *node) getValue(arena *Arena) (ret y.ValueStruct) {
-	val := atomic.LoadUint64(&n.value)
-	valSize, valOffset := decodeValue(val)
+func (s *Skiplist) Size() uint32 { return s.arena.Size() }
 
-	buf := arena.GetBytes(valOffset, valSize)
-	ret.Decode(buf)
+func (s *Skiplist) NewIterator() *Iterator {
+	s.IncrRef()
+	return &Iterator{list: s, arena: s.arena}
+}
+
+func (s *Skiplist) newNode(key, val []byte, meta uint16) (nd *node, height uint32, err error) {
+	// We do need to create a new node.
+	height = s.randomHeight()
+	nd, err = newNode(s.arena, key, val, meta, height)
+	if err != nil {
+		return
+	}
+
+	// Try to increase s.height via CAS.
+	listHeight := s.Height()
+	for height > listHeight {
+		if atomic.CompareAndSwapUint32(&s.height, listHeight, height) {
+			// Successfully increased skiplist.height.
+			break
+		}
+
+		listHeight = s.Height()
+	}
+
 	return
 }
 
-func (n *node) setValue(arena *Arena, v *y.ValueStruct) error {
-	val, err := n.allocVal(arena, v)
-	if err != nil {
-		return err
-	}
+func (s *Skiplist) getNext(nd *node, h int) *node {
+	offset := nd.nextOffset(h)
+	return (*node)(s.arena.GetPointer(offset))
+}
 
-	atomic.StoreUint64(&n.value, val)
-	return nil
+func (s *Skiplist) randomHeight() uint32 {
+	s.Lock()
+	defer s.Unlock()
+
+	return uint32(randomHeight(s.rng.Float64(), kMaxHeight))
+}
+
+func (n *node) getKey(arena *Arena) []byte {
+	return arena.GetBytes(n.keyOffset, uint16(n.keySize))
 }
 
 func (n *node) nextOffset(h int) uint32 {
@@ -177,351 +212,371 @@ func (n *node) unsafeTower() *[kMaxHeight]uint32 {
 	return (*[kMaxHeight]uint32)(unsafe.Pointer(&n.tower))
 }
 
-func (n *node) allocVal(arena *Arena, v *y.ValueStruct) (uint64, error) {
-	valSize := uint32(v.EncodedSize())
+func (n *node) allocVal(arena *Arena, val []byte, meta uint16) (uint64, error) {
+	valSize := uint16(len(val))
+	y.AssertTrue(int(valSize) == len(val))
+
 	valOffset, err := arena.Alloc(valSize, Align1)
 	if err != nil {
 		return 0, err
 	}
 
-	v.Encode(arena.GetBytes(valOffset, valSize))
-	return encodeValue(valSize, valOffset), nil
+	copy(arena.GetBytes(valOffset, valSize), val)
+	return encodeValue(valOffset, valSize, meta), nil
 }
 
-func encodeValue(valSize, valOffset uint32) uint64 {
-	return uint64(valSize)<<32 | uint64(valOffset)
+func encodeValue(valOffset uint32, valSize, meta uint16) uint64 {
+	return uint64(meta)<<48 | uint64(valSize)<<32 | uint64(valOffset)
 }
 
-func decodeValue(val uint64) (valSize, valOffset uint32) {
-	valSize = uint32(val >> 32)
-	valOffset = uint32(val & 0xffffffff)
+func decodeValue(value uint64) (valOffset uint32, valSize uint16) {
+	valOffset = uint32(value)
+	valSize = uint16(value >> 32)
 	return
 }
 
-func (s *Skiplist) randomHeight() int {
-	s.Lock()
-	defer s.Unlock()
-
-	return randomHeight(s.rng.Float64(), kMaxHeight)
+func decodeMeta(value uint64) uint16 {
+	return uint16(value >> 48)
 }
 
-// findNear finds the node near to key.
-// If less=true, it finds rightmost node such that node.key < key (if allowEqual=false) or
-// node.key <= key (if allowEqual=true).
-// If less=false, it finds leftmost node such that node.key > key (if allowEqual=false) or
-// node.key >= key (if allowEqual=true).
-// Returns the node found. The bool returned is true if the node has key equal to given key.
-func (s *Skiplist) findNear(key []byte, less bool, allowEqual bool) (*node, bool) {
-	x := s.head
-	level := int(s.Height() - 1)
-	for {
-		// Assume x.key < key.
-		next := s.getNext(x, level)
-		if next == nil {
-			// x.key < key < END OF LIST
-			if level > 0 {
-				// Can descend further to iterate closer to the end.
-				level--
-				continue
-			}
-			// Level=0. Cannot descend further. Let's return something that makes sense.
-			if !less {
-				return nil, false
-			}
-			// Try to return x. Make sure it is not a head node.
-			if x == s.head {
-				return nil, false
-			}
-			return x, false
-		}
-
-		nextKey := next.getKey(s.arena)
-		cmp := bytes.Compare(key, nextKey)
-		if cmp > 0 {
-			// x.key < next.key < key. We can continue to move right.
-			x = next
-			continue
-		}
-		if cmp == 0 {
-			// x.key < key == next.key.
-			if allowEqual {
-				return next, true
-			}
-			if !less {
-				// We want >, so go to base level to grab the next bigger note.
-				return s.getNext(next, 0), false
-			}
-			// We want <. If not base level, we should go closer in the next level.
-			if level > 0 {
-				level--
-				continue
-			}
-			// On base level. Return x.
-			if x == s.head {
-				return nil, false
-			}
-			return x, false
-		}
-		// cmp < 0. In other words, x.key < key < next.
-		if level > 0 {
-			level--
-			continue
-		}
-		// At base level. Need to return something.
-		if !less {
-			return next, false
-		}
-		// Try to return x. Make sure it is not a head node.
-		if x == s.head {
-			return nil, false
-		}
-		return x, false
-	}
+type splice struct {
+	prev *node
+	next *node
 }
 
-// findSpliceForLevel returns (outBefore, outAfter) with outBefore.key <= key <= outAfter.key.
-// The input "before" tells us where to start looking.
-// If we found a node with the same key, then we return outBefore = outAfter.
-// Otherwise, outBefore.key < key < outAfter.key.
-func (s *Skiplist) findSpliceForLevel(key []byte, before *node, level int) (*node, *node) {
-	for {
-		// Assume before.key < key.
-		next := s.getNext(before, level)
-		if next == nil {
-			return before, next
-		}
-
-		nextKey := next.getKey(s.arena)
-		cmp := bytes.Compare(key, nextKey)
-		if cmp == 0 {
-			// Equality case.
-			return next, next
-		}
-		if cmp < 0 {
-			// before.key < key < next.key. We are done for this level.
-			return before, next
-		}
-		before = next // Keep moving right on this level.
-	}
+func (s *splice) init(prev, next *node) {
+	s.prev = prev
+	s.next = next
 }
-
-func (s *Skiplist) Height() int32 {
-	return atomic.LoadInt32(&s.height)
-}
-
-// Put inserts the key-value pair.
-func (s *Skiplist) Put(key []byte, v y.ValueStruct) error {
-	// Since we allow overwrite, we may not need to create a new node. We might not even need to
-	// increase the height. Let's defer these actions.
-
-	listHeight := s.Height()
-	var prev [kMaxHeight + 1]*node
-	var next [kMaxHeight + 1]*node
-	prev[listHeight] = s.head
-	next[listHeight] = nil
-	for i := int(listHeight) - 1; i >= 0; i-- {
-		// Use higher level to speed up for current level.
-		prev[i], next[i] = s.findSpliceForLevel(key, prev[i+1], i)
-		if prev[i] == next[i] {
-			return prev[i].setValue(s.arena, &v)
-		}
-	}
-
-	// We do need to create a new node.
-	height := s.randomHeight()
-	x, err := newNode(s.arena, key, v, height)
-	if err != nil {
-		return err
-	}
-
-	// Try to increase s.height via CAS.
-	listHeight = s.Height()
-	for height > int(listHeight) {
-		if atomic.CompareAndSwapInt32(&s.height, listHeight, int32(height)) {
-			// Successfully increased skiplist.height.
-			break
-		}
-		listHeight = s.Height()
-	}
-
-	// We always insert from the base level and up. After you add a node in base level, we cannot
-	// create a node in the level above because it would have discovered the node in the base level.
-	for i := 0; i < height; i++ {
-		for {
-			if prev[i] == nil {
-				y.AssertTrue(i > 1) // This cannot happen in base level.
-				// We haven't computed prev, next for this level because height exceeds old listHeight.
-				// For these levels, we expect the lists to be sparse, so we can just search from head.
-				prev[i], next[i] = s.findSpliceForLevel(key, s.head, i)
-				// Someone adds the exact same key before we are able to do so. This can only happen on
-				// the base level. But we know we are not on the base level.
-				y.AssertTrue(prev[i] != next[i])
-			}
-
-			nextOffset := s.arena.GetPointerOffset(unsafe.Pointer(next[i]))
-			x.unsafeTower()[i] = nextOffset
-
-			if prev[i].casNextOffset(i, nextOffset, s.arena.GetPointerOffset(unsafe.Pointer(x))) {
-				// Managed to insert x between prev[i] and next[i]. Go to the next level.
-				break
-			}
-			// CAS failed. We need to recompute prev and next.
-			// It is unlikely to be helpful to try to use a different level as we redo the search,
-			// because it is unlikely that lots of nodes are inserted between prev[i] and next[i].
-			prev[i], next[i] = s.findSpliceForLevel(key, prev[i], i)
-			if prev[i] == next[i] {
-				y.AssertTruef(i == 0, "Equality can happen only on base level: %d", i)
-				return prev[i].setValue(s.arena, &v)
-			}
-		}
-	}
-
-	return nil
-}
-
-// findLast returns the last element. If head (empty list), we return nil. All the find functions
-// will NEVER return the head nodes.
-func (s *Skiplist) findLast() *node {
-	n := s.head
-	level := int(s.Height()) - 1
-	for {
-		next := s.getNext(n, level)
-		if next != nil {
-			n = next
-			continue
-		}
-		if level == 0 {
-			if n == s.head {
-				return nil
-			}
-			return n
-		}
-		level--
-	}
-}
-
-func (s *Skiplist) getNext(n *node, h int) *node {
-	offset := n.nextOffset(h)
-	return (*node)(s.arena.GetPointer(offset))
-}
-
-func (s *Skiplist) Get(key []byte) y.ValueStruct {
-	n, found := s.findNear(key, false, true) // findGreaterOrEqual.
-	if !found {
-		return y.ValueStruct{}
-	}
-	return n.getValue(s.arena)
-}
-
-func (s *Skiplist) NewIterator() *Iterator {
-	s.IncrRef()
-	return &Iterator{list: s}
-}
-
-func (s *Skiplist) Size() uint32 { return s.arena.Size() }
 
 // Iterator is an iterator over skiplist object. For new objects, you just
-// need to initialize Iterator.list.
+// need to initialize Iterator.list and Iterator.arena.
 type Iterator struct {
-	list *Skiplist
-	n    *node
+	list    *Skiplist
+	arena   *Arena
+	nd      *node
+	value   uint64
+	fingers [kMaxHeight]uint32
 }
 
-func (s *Iterator) Close() error {
-	s.list.DecrRef()
+func (it *Iterator) Close() error {
+	it.list.DecrRef()
 	return nil
 }
 
 // Valid returns true iff the iterator is positioned at a valid node.
-func (s *Iterator) Valid() bool { return s.n != nil }
+func (it *Iterator) Valid() bool { return it.nd != nil }
 
 // Key returns the key at the current position.
-func (s *Iterator) Key() []byte {
-	return s.n.getKey(s.list.arena)
+func (it *Iterator) Key() []byte {
+	return it.nd.getKey(it.list.arena)
 }
 
 // Value returns value.
-func (s *Iterator) Value() y.ValueStruct {
-	return s.n.getValue(s.list.arena)
+func (it *Iterator) Value() []byte {
+	valOffset, valSize := decodeValue(it.value)
+	return it.arena.GetBytes(valOffset, valSize)
+}
+
+func (it *Iterator) Meta() uint16 {
+	return decodeMeta(it.value)
 }
 
 // Next advances to the next position.
-func (s *Iterator) Next() {
-	y.AssertTrue(s.Valid())
-	s.n = s.list.getNext(s.n, 0)
+func (it *Iterator) Next() {
+	next := it.list.getNext(it.nd, 0)
+	it.setNode(next)
 }
 
-// Prev advances to the previous position.
-func (s *Iterator) Prev() {
-	y.AssertTrue(s.Valid())
-	s.n, _ = s.list.findNear(s.Key(), true, false) // find <. No equality allowed.
+func (it *Iterator) Seek(key []byte) (found bool) {
+	level := int(it.list.Height() - 1)
+
+	var prev, next *node
+	prev = it.list.head
+	for {
+		prev, next, found = it.findSpliceForLevel(key, level, prev)
+		prevOffset := it.arena.GetPointerOffset(unsafe.Pointer(prev))
+
+		if found {
+			for i := level; i >= 0; i-- {
+				it.fingers[level] = prevOffset
+			}
+
+			break
+		}
+
+		it.fingers[level] = prevOffset
+
+		if level == 0 {
+			break
+		}
+
+		level--
+	}
+
+	it.setNode(next)
+	return
 }
 
-// Seek advances to the first entry with a key >= target.
-func (s *Iterator) Seek(target []byte) {
-	s.n, _ = s.list.findNear(target, false, true) // find >=.
+// Add creates a new key/value record if it does not yet exist and positions the
+// iterator on it. If the record already exists, then Add positions the iterator
+// on the most current value and returns ErrRecordExists. If there isn't
+// enough room in the arena, then Add returns ErrArenaFull.
+func (it *Iterator) Add(key []byte, val []byte, meta uint16) error {
+	var spl [kMaxHeight]splice
+	if it.seekForSplice(key, &spl) {
+		// Found a matching node, but handle case where it's been deleted.
+		return it.setValueIfDeleted(spl[0].next, val, meta)
+	}
+
+	nd, height, err := it.list.newNode(key, val, uint16(meta))
+	if err != nil {
+		return err
+	}
+
+	value := nd.value
+	ndOffset := it.arena.GetPointerOffset(unsafe.Pointer(nd))
+
+	// We always insert from the base level and up. After you add a node in base
+	// level, we cannot create a node in the level above because it would have
+	// discovered the node in the base level.
+	var found bool
+	for i := 0; i < int(height); i++ {
+		prev := spl[i].prev
+		next := spl[i].next
+
+		if prev == nil {
+			// New node increased the height of the skiplist, so assume that the
+			// new level has not yet been populated.
+			prev = it.list.head
+			y.AssertTrue(next == nil)
+		}
+
+		for {
+			nextOffset := it.arena.GetPointerOffset(unsafe.Pointer(next))
+			nd.unsafeTower()[i] = nextOffset
+
+			if prev.casNextOffset(i, nextOffset, ndOffset) {
+				// Managed to insert nd between prev and next. Go to the next level.
+				break
+			}
+
+			// CAS failed. We need to recompute prev and next. It is unlikely to
+			// be helpful to try to use a different level as we redo the search,
+			// because it is unlikely that lots of nodes are inserted between prev
+			// and next.
+			prev, next, found = it.findSpliceForLevel(key, i, prev)
+			if found {
+				y.AssertTruef(i == 0, "Another thread can only race at the base level")
+				return it.setValueIfDeleted(next, val, meta)
+			}
+		}
+	}
+
+	it.value = value
+	it.nd = nd
+	return nil
 }
 
-// SeekForPrev finds an entry with key <= target.
-func (s *Iterator) SeekForPrev(target []byte) {
-	s.n, _ = s.list.findNear(target, true, true) // find <=.
+// Set updates the value of the current iteration record if it has not been
+// updated or deleted since iterating or seeking to it. If the record has been
+// updated, then Set positions the iterator on the most current value and
+// returns ErrRecordUpdated. If the record has been deleted, then Set positions
+// the iterator on the next non-deleted record and returns ErrRecordDeleted.
+func (it *Iterator) Set(val []byte, meta uint16) error {
+	new, err := it.nd.allocVal(it.arena, val, meta)
+	if err != nil {
+		return err
+	}
+
+	if !atomic.CompareAndSwapUint64(&it.nd.value, it.value, new) {
+		if it.setNode(it.nd) {
+			return ErrRecordUpdated
+		}
+
+		return ErrRecordDeleted
+	}
+
+	it.value = new
+	return nil
+}
+
+// Delete marks the current iterator record as deleted from the store if it
+// has not been updated since iterating or seeking to it. If the record has
+// been updated, then Delete positions the iterator on the most current value
+// and returns ErrRecordUpdated. If the record is deleted, then Delete positions
+// the iterator on the next record.
+func (it *Iterator) Delete() error {
+	if !atomic.CompareAndSwapUint64(&it.nd.value, it.value, kDeletedVal) {
+		if it.setNode(it.nd) {
+			return ErrRecordUpdated
+		}
+
+		return nil
+	}
+
+	// Deletion succeeded, so position iterator on next non-deleted node.
+	next := it.list.getNext(it.nd, 0)
+	it.setNode(next)
+	return nil
 }
 
 // SeekToFirst seeks position at the first entry in list.
 // Final state of iterator is Valid() iff list is not empty.
-func (s *Iterator) SeekToFirst() {
-	s.n = s.list.getNext(s.list.head, 0)
+func (it *Iterator) SeekToFirst() {
+	it.setNode(it.list.getNext(it.list.head, 0))
 }
 
-// SeekToLast seeks position at the last entry in list.
-// Final state of iterator is Valid() iff list is not empty.
-func (s *Iterator) SeekToLast() {
-	s.n = s.list.findLast()
+func (it *Iterator) Name() string { return "SkiplistIterator" }
+
+func (it *Iterator) setNode(nd *node) bool {
+	var value uint64
+
+	success := true
+	for nd != nil {
+		// Skip past deleted nodes.
+		value = atomic.LoadUint64(&nd.value)
+		if value != kDeletedVal {
+			break
+		}
+
+		success = false
+		nd = it.list.getNext(nd, 0)
+	}
+
+	it.value = value
+	it.nd = nd
+	return success
 }
 
-func (s *Iterator) Name() string { return "SkiplistIterator" }
+func (it *Iterator) setValueIfDeleted(nd *node, val []byte, meta uint16) error {
+	var new uint64
+	var err error
+
+	for {
+		old := atomic.LoadUint64(&nd.value)
+
+		if old != kDeletedVal {
+			it.value = old
+			it.nd = nd
+			return ErrRecordExists
+		}
+
+		if new == 0 {
+			new, err = nd.allocVal(it.arena, val, meta)
+			if err != nil {
+				return err
+			}
+		}
+
+		if atomic.CompareAndSwapUint64(&nd.value, old, new) {
+			break
+		}
+	}
+
+	it.value = new
+	it.nd = nd
+	return err
+}
+
+func (it *Iterator) findSpliceForLevel(key []byte, level int, before *node) (prev, next *node, found bool) {
+	prev = before
+
+	for {
+		// Assume prev.key < key.
+		next = it.list.getNext(prev, level)
+		if next == nil {
+			break
+		}
+
+		nextKey := next.getKey(it.arena)
+		cmp := bytes.Compare(key, nextKey)
+		if cmp == 0 {
+			// Equality case.
+			found = true
+			break
+		}
+
+		if cmp < 0 {
+			// We are done for this level, since prevNode.key < key < nextNode.key.
+			break
+		}
+
+		// Keep moving right on this level.
+		prev = next
+	}
+
+	return
+}
+
+func (it *Iterator) seekForSplice(key []byte, spl *[kMaxHeight]splice) (found bool) {
+	var prev, next *node
+
+	level := int(it.list.Height() - 1)
+	prev = it.list.head
+
+	useFingers := true
+	for {
+		if useFingers {
+			nd := (*node)(it.arena.GetPointer(it.fingers[level]))
+			if nd != nil && bytes.Compare(key, nd.getKey(it.arena)) > 0 {
+				prev = nd
+			} else {
+				useFingers = false
+			}
+		}
+
+		oldPrev := prev
+		prev, next, found = it.findSpliceForLevel(key, level, prev)
+		spl[level].init(prev, next)
+		it.fingers[level] = it.arena.GetPointerOffset(unsafe.Pointer(prev))
+
+		// If a new value has been stored in the current level's finger, then
+		// the iterator has changed position, and so stop using previously stored
+		// fingers as a starting position.
+		if useFingers && oldPrev != prev {
+			useFingers = false
+		}
+
+		if level == 0 {
+			break
+		}
+
+		level--
+	}
+
+	return
+}
 
 // UniIterator is a unidirectional memtable iterator. It is a thin wrapper around
 // Iterator. We like to keep Iterator as before, because it is more powerful and
 // we might support bidirectional iterators in the future.
 type UniIterator struct {
-	iter     *Iterator
-	reversed bool
+	iter *Iterator
 }
 
 func (s *Skiplist) NewUniIterator(reversed bool) *UniIterator {
-	return &UniIterator{
-		iter:     s.NewIterator(),
-		reversed: reversed,
-	}
+	y.AssertTruef(!reversed, "reversed iterator not supported")
+	return &UniIterator{iter: s.NewIterator()}
 }
 
 func (s *UniIterator) Next() {
-	if !s.reversed {
-		s.iter.Next()
-	} else {
-		s.iter.Prev()
-	}
+	s.iter.Next()
 }
 
 func (s *UniIterator) Rewind() {
-	if !s.reversed {
-		s.iter.SeekToFirst()
-	} else {
-		s.iter.SeekToLast()
-	}
+	s.iter.SeekToFirst()
 }
 
 func (s *UniIterator) Seek(key []byte) {
-	if !s.reversed {
-		s.iter.Seek(key)
-	} else {
-		s.iter.SeekForPrev(key)
-	}
+	s.iter.Seek(key)
 }
 
-func (s *UniIterator) Key() []byte          { return s.iter.Key() }
-func (s *UniIterator) Value() y.ValueStruct { return s.iter.Value() }
-func (s *UniIterator) Valid() bool          { return s.iter.Valid() }
-func (s *UniIterator) Name() string         { return "UniMemtableIterator" }
-func (s *UniIterator) Close() error         { return s.iter.Close() }
+func (s *UniIterator) Value() y.ValueStruct {
+	return y.ValueStruct{Value: s.iter.Value(), Meta: byte(s.iter.Meta())}
+}
+
+func (s *UniIterator) Key() []byte  { return s.iter.Key() }
+func (s *UniIterator) Valid() bool  { return s.iter.Valid() }
+func (s *UniIterator) Name() string { return "UniMemtableIterator" }
+func (s *UniIterator) Close() error { return s.iter.Close() }

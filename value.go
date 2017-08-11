@@ -41,10 +41,10 @@ import (
 // Values have their first byte being byteData or byteDelete. This helps us distinguish between
 // a key that has never been seen and a key that has been explicitly deleted.
 const (
-	BitDelete       byte  = 1 // Set if the key has been deleted.
-	BitValuePointer byte  = 2 // Set if the value is NOT stored directly next to key.
-	BitCompressed   byte  = 4 // Set if the key value pair is stored compressed in value log.
-	BitSetIfAbsent  byte  = 8 // Set if the key is set using SetIfAbsent.
+	BitValuePointer byte  = 1    // Set if the value is NOT stored directly next to key.
+	BitCompressed   byte  = 2    // Set if the key value pair is stored compressed in value log.
+	BitSetIfAbsent  byte  = 4    // Set if the key is set using SetIfAbsent.
+	BitDelete       byte  = 0x80 // Set if the key has been deleted.
 	M               int64 = 1 << 20
 )
 

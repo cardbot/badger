@@ -254,15 +254,13 @@ func NewKV(optParam *Options) (out *KV, err error) {
 			meta = meta | BitValuePointer
 		}
 
-		v := y.ValueStruct{
-			Value: nv,
-			Meta:  meta,
-		}
 		for err := out.ensureRoomForWrite(); err != nil; err = out.ensureRoomForWrite() {
 			out.elog.Printf("Replay: Making room for writes")
 			time.Sleep(10 * time.Millisecond)
 		}
-		out.mt.Put(nk, v)
+
+		out.putMemtable(out.mt, nk, nv, meta)
+
 		return nil
 	}
 	if err = out.vlog.Replay(vptr, fn); err != nil {
@@ -448,10 +446,11 @@ func (s *KV) get(key []byte) (y.ValueStruct, error) {
 
 	y.NumGets.Add(1)
 	for i := 0; i < len(tables); i++ {
-		vs := tables[i].Get(key)
 		y.NumMemtableGets.Add(1)
-		if vs.Meta != 0 || vs.Value != nil {
-			return vs, nil
+		it := tables[i].NewIterator()
+		defer it.Close()
+		if it.Seek(key) {
+			return y.ValueStruct{Value: it.Value(), Meta: byte(it.Meta())}, nil
 		}
 	}
 	return s.lc.get(key)
@@ -548,18 +547,33 @@ func (s *KV) writeToLSM(b *request) error {
 		}
 
 		if s.shouldWriteValueToLSM(*entry) { // Will include deletion / tombstone case.
-			s.mt.Put(entry.Key,
-				y.ValueStruct{
-					Value: entry.Value,
-					Meta:  entry.Meta})
+			s.putMemtable(s.mt, entry.Key, entry.Value, entry.Meta)
 		} else {
-			s.mt.Put(entry.Key,
-				y.ValueStruct{
-					Value: b.Ptrs[i].Encode(offsetBuf[:]),
-					Meta:  entry.Meta | BitValuePointer})
+			s.putMemtable(s.mt, entry.Key, b.Ptrs[i].Encode(offsetBuf[:]), entry.Meta|BitValuePointer)
 		}
 	}
 	return nil
+}
+
+func (s *KV) putMemtable(mt *skl.Skiplist, key, val []byte, meta byte) {
+	it := mt.NewIterator()
+	defer it.Close()
+
+	for {
+		err := it.Add(key, val, uint16(meta))
+		if err == nil {
+			break
+		}
+
+		y.AssertTrue(err != skl.ErrArenaFull)
+
+		err = it.Set(val, uint16(meta))
+		if err == nil {
+			break
+		}
+
+		y.AssertTrue(err != skl.ErrArenaFull)
+	}
 }
 
 // writeRequests is called serially by only one goroutine.
@@ -872,7 +886,8 @@ func writeLevel0Table(s *skl.Skiplist, f *os.File) error {
 	b := table.NewTableBuilder()
 	defer b.Close()
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
-		if err := b.Add(iter.Key(), iter.Value()); err != nil {
+		v := y.ValueStruct{Value: iter.Value(), Meta: uint8(iter.Meta())}
+		if err := b.Add(iter.Key(), v); err != nil {
 			return err
 		}
 	}
@@ -900,7 +915,7 @@ func (s *KV) flushMemtable(lc *y.LevelCloser) error {
 			s.Lock() // For vptr
 			s.vptr.Encode(offset)
 			s.Unlock()
-			ft.mt.Put(head, y.ValueStruct{Value: offset})
+			s.putMemtable(ft.mt, head, offset, 0)
 		}
 		fileID, _ := s.lc.reserveFileIDs(1)
 		fd, err := y.OpenSyncedFile(table.NewFilename(fileID, s.opt.Dir), true)
