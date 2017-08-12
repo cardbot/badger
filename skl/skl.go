@@ -36,6 +36,7 @@ import (
 	"bytes"
 	"errors"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,32 +48,49 @@ import (
 const (
 	kMaxHeight  = 20
 	kNodeSize   = uint16(unsafe.Sizeof(node{}))
-	kUint32Size = 4
+	kLinksSize  = uint16(unsafe.Sizeof(links{}))
 	kDeletedVal = 0
 )
+
+const MaxNodeSize = int(unsafe.Sizeof(node{})) + (kMaxHeight-1)*int(kLinksSize)
 
 var ErrRecordExists = errors.New("record with this key already exists")
 var ErrRecordUpdated = errors.New("record was updated by another caller")
 var ErrRecordDeleted = errors.New("record was deleted by another caller")
 
-type node struct {
-	// A byte slice is 24 bytes. We are trying to save space here.
-	keyOffset uint32 // Immutable. No need to lock to access key.
-	keySize   uint32
+type links struct {
+	nextOffset uint32
+	prevOffset uint32
+}
 
+type node struct {
 	// Multiple parts of the value are encoded as a single uint64 so that it
 	// can be atomically loaded and stored:
 	//   uint32: offset
 	//   uint16: size
 	//   uint16: meta
+	//
+	// Note: This field should be aligned on an 8-byte boundary to avoid
+	//       performance penalties on some architectures.
 	value uint64
 
+	// Immutable fields, so no need to lock to access key.
+	keyOffset uint32
+	keySize   uint16
+
+	// Filler field to ensure that tower is aligned on 4-byte boundary.
+	_ uint16
+
 	// When node is allocated, extra space is allocated after it in memory,
-	// and unsafe operations are used to access array elements. This is
-	// usually a very small array, since the probability of each successive
-	// level decreases exponentially. The size is always <= kMaxHeight. All
-	// accesses to elements should use CAS operations, with no need to lock.
-	tower [1]uint32
+	// and unsafe operations are used to access array elements, which are
+	// offsets to the previous and next nodes. This is usually a very small
+	// array, since the probability of each successive level decreases
+	// exponentially. The size is always <= kMaxHeight. All accesses to elements
+	// should use CAS operations, with no need to lock.
+	//
+	// Note: This field should be aligned on a 4-byte boundary to avoid
+	//       performance penalties on some architectures.
+	tower [1]links
 }
 
 type Skiplist struct {
@@ -80,9 +98,14 @@ type Skiplist struct {
 
 	height uint32 // Current height. 1 <= height <= kMaxHeight. CAS.
 	head   *node
+	tail   *node
 	ref    int32
 	arena  *Arena
 	rng    *rand.Rand
+
+	// If set to true by tests, then extra delays are added to make it easier to
+	// detect unusual race conditions.
+	testing bool
 }
 
 func (s *Skiplist) IncrRef() {
@@ -102,38 +125,32 @@ func (s *Skiplist) DecrRef() {
 
 func (s *Skiplist) Valid() bool { return s.arena != nil }
 
-func newNode(arena *Arena, key, val []byte, meta uint16, height uint32) (*node, error) {
-	keySize := uint16(len(key))
-	keyOffset, err := arena.Alloc(keySize, Align1)
-	if err != nil {
-		return nil, err
-	}
-
-	copy(arena.GetBytes(keyOffset, keySize), key)
-
+func newNode(arena *Arena, height uint32) (nd *node, err error) {
 	// The base level is already allocated in the node struct.
-	towerSize := uint16(kUint32Size * (height - 1))
-	nodeOffset, err := arena.Alloc(kNodeSize+towerSize, Align8)
+	towerSize := kLinksSize * uint16(height-1)
+	nodeOffset, err := arena.Alloc(uint16(kNodeSize+towerSize), Align8)
 	if err != nil {
 		return nil, err
 	}
 
-	node := (*node)(arena.GetPointer(nodeOffset))
-	node.keyOffset = keyOffset
-	node.keySize = uint32(keySize)
-	node.value, err = node.allocVal(arena, val, meta)
-	if err != nil {
-		return nil, err
-	}
-
-	return node, nil
+	return (*node)(arena.GetPointer(nodeOffset)), nil
 }
 
 func NewSkiplist(arenaSize uint32) *Skiplist {
 	arena := NewArena(arenaSize)
-	head, err := newNode(arena, nil, nil, 0, kMaxHeight)
-	if err != nil {
-		panic("arenaSize is not large enough to hold the head node")
+
+	// Allocate head and tail nodes.
+	head, err := newNode(arena, kMaxHeight)
+	y.AssertTruef(err == nil, "arenaSize is not large enough to hold the head node")
+	tail, err := newNode(arena, kMaxHeight)
+	y.AssertTruef(err == nil, "arenaSize is not large enough to hold the tail node")
+
+	// Link all head/tail levels together.
+	headOffset := arena.GetPointerOffset(unsafe.Pointer(head))
+	tailOffset := arena.GetPointerOffset(unsafe.Pointer(tail))
+	for i := 0; i < kMaxHeight; i++ {
+		head.unsafeTower()[i].nextOffset = tailOffset
+		tail.unsafeTower()[i].prevOffset = headOffset
 	}
 
 	// Use private random number generator, in order to avoid global lock used
@@ -143,6 +160,7 @@ func NewSkiplist(arenaSize uint32) *Skiplist {
 	skl := &Skiplist{
 		height: 1,
 		head:   head,
+		tail:   tail,
 		arena:  arena,
 		ref:    1,
 		rng:    rng,
@@ -163,9 +181,8 @@ func (s *Skiplist) NewIterator() *Iterator {
 }
 
 func (s *Skiplist) newNode(key, val []byte, meta uint16) (nd *node, height uint32, err error) {
-	// We do need to create a new node.
 	height = s.randomHeight()
-	nd, err = newNode(s.arena, key, val, meta, height)
+	nd, err = newNode(s.arena, height)
 	if err != nil {
 		return
 	}
@@ -181,6 +198,13 @@ func (s *Skiplist) newNode(key, val []byte, meta uint16) (nd *node, height uint3
 		listHeight = s.Height()
 	}
 
+	// Allocate node's key and value.
+	nd.keyOffset, nd.keySize, err = allocKey(s.arena, key)
+	if err != nil {
+		return
+	}
+
+	nd.value, err = allocVal(s.arena, val, meta)
 	return
 }
 
@@ -190,11 +214,12 @@ func (s *Skiplist) findSpliceForLevel(key []byte, level int, start *node) (prev,
 	for {
 		// Assume prev.key < key.
 		next = s.getNext(prev, level)
-		if next == nil {
+		nextKey := next.getKey(s.arena)
+		if nextKey == nil {
+			// Tail node key, so done.
 			break
 		}
 
-		nextKey := next.getKey(s.arena)
 		cmp := bytes.Compare(key, nextKey)
 		if cmp == 0 {
 			// Equality case.
@@ -215,7 +240,12 @@ func (s *Skiplist) findSpliceForLevel(key []byte, level int, start *node) (prev,
 }
 
 func (s *Skiplist) getNext(nd *node, h int) *node {
-	offset := nd.nextOffset(h)
+	offset := atomic.LoadUint32(&nd.unsafeTower()[h].nextOffset)
+	return (*node)(s.arena.GetPointer(offset))
+}
+
+func (s *Skiplist) getPrev(nd *node, h int) *node {
+	offset := atomic.LoadUint32(&nd.unsafeTower()[h].prevOffset)
 	return (*node)(s.arena.GetPointer(offset))
 }
 
@@ -226,23 +256,46 @@ func (s *Skiplist) randomHeight() uint32 {
 	return uint32(randomHeight(s.rng.Float64(), kMaxHeight))
 }
 
+func (l *links) init(prevOffset, nextOffset uint32) {
+	l.nextOffset = nextOffset
+	l.prevOffset = prevOffset
+}
+
 func (n *node) getKey(arena *Arena) []byte {
 	return arena.GetBytes(n.keyOffset, uint16(n.keySize))
 }
 
 func (n *node) nextOffset(h int) uint32 {
-	return atomic.LoadUint32(&n.unsafeTower()[h])
+	return atomic.LoadUint32(&n.unsafeTower()[h].nextOffset)
+}
+
+func (n *node) prevOffset(h int) uint32 {
+	return atomic.LoadUint32(&n.unsafeTower()[h].prevOffset)
 }
 
 func (n *node) casNextOffset(h int, old, val uint32) bool {
-	return atomic.CompareAndSwapUint32(&n.unsafeTower()[h], old, val)
+	return atomic.CompareAndSwapUint32(&n.unsafeTower()[h].nextOffset, old, val)
 }
 
-func (n *node) unsafeTower() *[kMaxHeight]uint32 {
-	return (*[kMaxHeight]uint32)(unsafe.Pointer(&n.tower))
+func (n *node) casPrevOffset(h int, old, val uint32) bool {
+	return atomic.CompareAndSwapUint32(&n.unsafeTower()[h].prevOffset, old, val)
 }
 
-func (n *node) allocVal(arena *Arena, val []byte, meta uint16) (uint64, error) {
+func (n *node) unsafeTower() *[kMaxHeight]links {
+	return (*[kMaxHeight]links)(unsafe.Pointer(&n.tower))
+}
+
+func allocKey(arena *Arena, key []byte) (keyOffset uint32, keySize uint16, err error) {
+	keySize = uint16(len(key))
+	keyOffset, err = arena.Alloc(keySize, Align1)
+	if err == nil {
+		copy(arena.GetBytes(keyOffset, keySize), key)
+	}
+
+	return
+}
+
+func allocVal(arena *Arena, val []byte, meta uint16) (uint64, error) {
 	valSize := uint16(len(val))
 	y.AssertTrue(int(valSize) == len(val))
 
@@ -315,25 +368,29 @@ func (it *Iterator) Meta() uint16 {
 // Next advances to the next position.
 func (it *Iterator) Next() {
 	next := it.list.getNext(it.nd, 0)
-	it.setNode(next)
+	it.setNode(next, false)
+}
+
+// Prev moves to the previous position.
+func (it *Iterator) Prev() {
+	prev := it.list.getPrev(it.nd, 0)
+	it.setNode(prev, true)
 }
 
 func (it *Iterator) Seek(key []byte) (found bool) {
 	var next *node
 	_, next, found = it.seekBaseSplice(key)
-	it.setNode(next)
+	it.setNode(next, false)
 	return
 }
 
-func (it *Iterator) SeekPrev(key []byte) (found bool) {
+func (it *Iterator) SeekForPrev(key []byte) (found bool) {
 	var prev, next *node
 	prev, next, found = it.seekBaseSplice(key)
 	if found {
-		it.setNode(next)
-	} else if prev != it.list.head {
-		it.setNode(prev)
+		it.setNode(next, true)
 	} else {
-		it.setNode(nil)
+		it.setNode(prev, true)
 	}
 
 	return
@@ -350,7 +407,14 @@ func (it *Iterator) Add(key []byte, val []byte, meta uint16) error {
 		return it.setValueIfDeleted(spl[0].next, val, meta)
 	}
 
-	nd, height, err := it.list.newNode(key, val, uint16(meta))
+	if it.list.testing {
+		// Add delay to make it easier to test race between this thread
+		// and another thread that sees the intermediate state between
+		// finding the splice and using it.
+		runtime.Gosched()
+	}
+
+	nd, height, err := it.list.newNode(key, val, meta)
 	if err != nil {
 		return err
 	}
@@ -369,16 +433,47 @@ func (it *Iterator) Add(key []byte, val []byte, meta uint16) error {
 		if prev == nil {
 			// New node increased the height of the skiplist, so assume that the
 			// new level has not yet been populated.
-			prev = it.list.head
 			y.AssertTrue(next == nil)
+			prev = it.list.head
+			next = it.list.tail
 		}
 
 		for {
+			prevOffset := it.arena.GetPointerOffset(unsafe.Pointer(prev))
 			nextOffset := it.arena.GetPointerOffset(unsafe.Pointer(next))
-			nd.unsafeTower()[i] = nextOffset
+			nd.unsafeTower()[i].init(prevOffset, nextOffset)
+
+			// Check whether next has an updated link to prev. If it does not,
+			// that can mean one of two things:
+			//   1. The thread that added the next node hasn't yet had a chance
+			//      to add the prev link (but will shortly).
+			//   2. Another thread has added a new node between prev and next.
+			nextPrevOffset := next.prevOffset(i)
+			if nextPrevOffset != prevOffset {
+				// Determine whether #1 or #2 is true by checking whether prev
+				// is still pointing to next. As long as the atomic operations
+				// have at least acquire/release semantics (no need for
+				// sequential consistency), this works, as it is equivalent to
+				// the "publication safety" pattern.
+				prevNextOffset := prev.nextOffset(i)
+				if prevNextOffset == nextOffset {
+					// Ok, case #1 is true, so help the other thread along by
+					// updating the next node's prev link.
+					next.casPrevOffset(i, nextPrevOffset, prevOffset)
+				}
+			}
 
 			if prev.casNextOffset(i, nextOffset, ndOffset) {
-				// Managed to insert nd between prev and next. Go to the next level.
+				// Managed to insert nd between prev and next, so update the next
+				// node's prev link and go to the next level.
+				if it.list.testing {
+					// Add delay to make it easier to test race between this thread
+					// and another thread that sees the intermediate state between
+					// setting next and setting prev.
+					runtime.Gosched()
+				}
+
+				next.casPrevOffset(i, prevOffset, ndOffset)
 				break
 			}
 
@@ -405,13 +500,13 @@ func (it *Iterator) Add(key []byte, val []byte, meta uint16) error {
 // returns ErrRecordUpdated. If the record has been deleted, then Set positions
 // the iterator on the next non-deleted record and returns ErrRecordDeleted.
 func (it *Iterator) Set(val []byte, meta uint16) error {
-	new, err := it.nd.allocVal(it.arena, val, meta)
+	new, err := allocVal(it.arena, val, meta)
 	if err != nil {
 		return err
 	}
 
 	if !atomic.CompareAndSwapUint64(&it.nd.value, it.value, new) {
-		if it.setNode(it.nd) {
+		if it.setNode(it.nd, false) {
 			return ErrRecordUpdated
 		}
 
@@ -429,7 +524,7 @@ func (it *Iterator) Set(val []byte, meta uint16) error {
 // the iterator on the next record.
 func (it *Iterator) Delete() error {
 	if !atomic.CompareAndSwapUint64(&it.nd.value, it.value, kDeletedVal) {
-		if it.setNode(it.nd) {
+		if it.setNode(it.nd, false) {
 			return ErrRecordUpdated
 		}
 
@@ -438,19 +533,25 @@ func (it *Iterator) Delete() error {
 
 	// Deletion succeeded, so position iterator on next non-deleted node.
 	next := it.list.getNext(it.nd, 0)
-	it.setNode(next)
+	it.setNode(next, false)
 	return nil
 }
 
 // SeekToFirst seeks position at the first entry in list.
 // Final state of iterator is Valid() iff list is not empty.
 func (it *Iterator) SeekToFirst() {
-	it.setNode(it.list.getNext(it.list.head, 0))
+	it.setNode(it.list.getNext(it.list.head, 0), false)
+}
+
+// SeekToLast seeks position at the last entry in list.
+// Final state of iterator is Valid() iff list is not empty.
+func (it *Iterator) SeekToLast() {
+	it.setNode(it.list.getPrev(it.list.tail, 0), true)
 }
 
 func (it *Iterator) Name() string { return "SkiplistIterator" }
 
-func (it *Iterator) setNode(nd *node) bool {
+func (it *Iterator) setNode(nd *node, reverse bool) bool {
 	var value uint64
 
 	success := true
@@ -462,7 +563,12 @@ func (it *Iterator) setNode(nd *node) bool {
 		}
 
 		success = false
-		nd = it.list.getNext(nd, 0)
+
+		if reverse {
+			nd = it.list.getPrev(nd, 0)
+		} else {
+			nd = it.list.getNext(nd, 0)
+		}
 	}
 
 	it.value = value
@@ -484,7 +590,7 @@ func (it *Iterator) setValueIfDeleted(nd *node, val []byte, meta uint16) error {
 		}
 
 		if new == 0 {
-			new, err = nd.allocVal(it.arena, val, meta)
+			new, err = allocVal(it.arena, val, meta)
 			if err != nil {
 				return err
 			}
@@ -519,6 +625,10 @@ func (it *Iterator) seekForSplice(key []byte, spl *[kMaxHeight]splice) (found bo
 
 		oldPrev := prev
 		prev, next, found = it.list.findSpliceForLevel(key, level, prev)
+		if next == nil {
+			next = it.list.tail
+		}
+
 		spl[level].init(prev, next)
 		it.fingers[level] = it.arena.GetPointerOffset(unsafe.Pointer(prev))
 

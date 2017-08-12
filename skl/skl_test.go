@@ -46,6 +46,17 @@ func length(s *Skiplist) int {
 	return count
 }
 
+// length iterates over skiplist in reverse order to give exact size.
+func lengthRev(s *Skiplist) int {
+	count := 0
+	it := s.NewIterator()
+	for it.SeekToLast(); it.Valid(); it.Prev() {
+		count++
+	}
+
+	return count
+}
+
 func TestEmpty(t *testing.T) {
 	key := []byte("aaa")
 	l := NewSkiplist(arenaSize)
@@ -54,6 +65,9 @@ func TestEmpty(t *testing.T) {
 	require.False(t, it.Valid())
 
 	it.SeekToFirst()
+	require.False(t, it.Valid())
+
+	it.SeekToLast()
 	require.False(t, it.Valid())
 
 	found := it.Seek(key)
@@ -131,7 +145,12 @@ func TestBasic(t *testing.T) {
 // TestConcurrentBasic tests concurrent writes followed by concurrent reads.
 func TestConcurrentBasic(t *testing.T) {
 	const n = 1000
+
+	// Set testing flag to make it easier to trigger unusual race conditions.
 	l := NewSkiplist(arenaSize)
+	defer l.DecrRef()
+	l.testing = true
+
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -142,6 +161,7 @@ func TestConcurrentBasic(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+
 	// Check values. Concurrent reads.
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -155,14 +175,18 @@ func TestConcurrentBasic(t *testing.T) {
 	}
 	wg.Wait()
 	require.Equal(t, n, length(l))
+	require.Equal(t, n, lengthRev(l))
 }
 
-// TestOneKey will read while writing to one single key.
-func TestOneKey(t *testing.T) {
+// TestConcurrentOneKey will read while writing to one single key.
+func TestConcurrentOneKey(t *testing.T) {
 	const n = 100
 	key := []byte("thekey")
+
+	// Set testing flag to make it easier to trigger unusual race conditions.
 	l := NewSkiplist(arenaSize)
 	defer l.DecrRef()
+	l.testing = true
 
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -193,6 +217,7 @@ func TestOneKey(t *testing.T) {
 	wg.Wait()
 	require.True(t, sawValue > 0)
 	require.Equal(t, 1, length(l))
+	require.Equal(t, 1, lengthRev(l))
 }
 
 func TestIteratorAdd(t *testing.T) {
@@ -201,8 +226,23 @@ func TestIteratorAdd(t *testing.T) {
 	it := l.NewIterator()
 	defer it.Close()
 
+	// Add nil key and value (treated same as empty).
+	err := it.Add(nil, nil, 0)
+	require.Nil(t, err)
+	require.EqualValues(t, []byte{}, it.Key())
+	require.EqualValues(t, []byte{}, it.Value())
+	require.EqualValues(t, 0, it.Meta())
+	it.Delete()
+
+	// Add empty key and value (treated same as nil).
+	err = it.Add([]byte{}, []byte{}, 0)
+	require.Nil(t, err)
+	require.EqualValues(t, []byte{}, it.Key())
+	require.EqualValues(t, []byte{}, it.Value())
+	require.EqualValues(t, 0, it.Meta())
+
 	// Add to empty list.
-	err := it.Add([]byte("00002"), []byte("00002"), 50)
+	err = it.Add([]byte("00002"), []byte("00002"), 50)
 	require.Nil(t, err)
 	require.EqualValues(t, "00002", it.Value())
 	require.EqualValues(t, 50, it.Meta())
@@ -238,6 +278,9 @@ func TestIteratorAdd(t *testing.T) {
 	require.Nil(t, err)
 	require.EqualValues(t, []byte("00004*"), it.Value())
 	require.EqualValues(t, 300, it.Meta())
+
+	require.Equal(t, 5, length(l))
+	require.Equal(t, 5, lengthRev(l))
 }
 
 func TestIteratorSet(t *testing.T) {
@@ -282,7 +325,9 @@ func TestIteratorSet(t *testing.T) {
 	require.Equal(t, ErrRecordDeleted, err)
 	require.EqualValues(t, "00002", it2.Value())
 	require.EqualValues(t, 500, it.Meta())
+
 	require.Equal(t, 1, length(l))
+	require.Equal(t, 1, lengthRev(l))
 }
 
 func TestIteratorDelete(t *testing.T) {
@@ -339,13 +384,17 @@ func TestIteratorDelete(t *testing.T) {
 	require.Nil(t, err)
 	require.False(t, it.Valid())
 	require.Equal(t, 0, length(l))
+	require.Equal(t, 0, lengthRev(l))
 }
 
 // TestConcurrentAdd races between adding same nodes.
 func TestConcurrentAdd(t *testing.T) {
 	const n = 100
+
+	// Set testing flag to make it easier to trigger unusual race conditions.
 	l := NewSkiplist(arenaSize)
 	defer l.DecrRef()
+	l.testing = true
 
 	start := make([]sync.WaitGroup, n)
 	end := make([]sync.WaitGroup, n)
@@ -381,13 +430,17 @@ func TestConcurrentAdd(t *testing.T) {
 	}
 
 	require.Equal(t, n, length(l))
+	require.Equal(t, n, lengthRev(l))
 }
 
 // TestConcurrentAddDelete races between adding and deleting the same node.
 func TestConcurrentAddDelete(t *testing.T) {
 	const n = 100
+
+	// Set testing flag to make it easier to trigger unusual race conditions.
 	l := NewSkiplist(arenaSize)
 	defer l.DecrRef()
+	l.testing = true
 
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -414,6 +467,9 @@ func TestConcurrentAddDelete(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+
+	require.Equal(t, 1, length(l))
+	require.Equal(t, 1, lengthRev(l))
 }
 
 // TestIteratorNext tests a basic iteration over all nodes from the beginning.
@@ -424,16 +480,44 @@ func TestIteratorNext(t *testing.T) {
 	it := l.NewIterator()
 	defer it.Close()
 	require.False(t, it.Valid())
+
 	it.SeekToFirst()
 	require.False(t, it.Valid())
+
 	for i := n - 1; i >= 0; i-- {
 		it.Add([]byte(fmt.Sprintf("%05d", i)), newValue(i), 0)
 	}
+
 	it.SeekToFirst()
 	for i := 0; i < n; i++ {
 		require.True(t, it.Valid())
 		require.EqualValues(t, newValue(i), it.Value())
 		it.Next()
+	}
+	require.False(t, it.Valid())
+}
+
+// TestIteratorPrev tests a basic iteration over all nodes from the end.
+func TestIteratorPrev(t *testing.T) {
+	const n = 100
+	l := NewSkiplist(arenaSize)
+	defer l.DecrRef()
+	it := l.NewIterator()
+	defer it.Close()
+	require.False(t, it.Valid())
+
+	it.SeekToLast()
+	require.False(t, it.Valid())
+
+	for i := 0; i < n; i++ {
+		it.Add([]byte(fmt.Sprintf("%05d", i)), newValue(i), 0)
+	}
+
+	it.SeekToLast()
+	for i := n - 1; i >= 0; i-- {
+		require.True(t, it.Valid())
+		require.EqualValues(t, newValue(i), it.Value())
+		it.Prev()
 	}
 	require.False(t, it.Valid())
 }
@@ -454,31 +538,51 @@ func TestIteratorSeek(t *testing.T) {
 		v := i*10 + 1000
 		it.Add([]byte(fmt.Sprintf("%05d", i*10+1000)), newValue(v), uint16(v))
 	}
-	it.Seek([]byte(""))
+
+	found := it.Seek([]byte(""))
+	require.False(t, found)
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01000", it.Value())
 	require.EqualValues(t, 1000, it.Meta())
 
-	it.Seek([]byte("01000"))
+	found = it.Seek([]byte("01000"))
+	require.True(t, found)
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01000", it.Value())
 	require.EqualValues(t, 1000, it.Meta())
 
-	it.Seek([]byte("01005"))
+	found = it.Seek([]byte("01005"))
+	require.False(t, found)
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01010", it.Value())
 	require.EqualValues(t, 1010, it.Meta())
 
-	it.Seek([]byte("01010"))
+	found = it.Seek([]byte("01010"))
+	require.True(t, found)
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01010", it.Value())
 	require.EqualValues(t, 1010, it.Meta())
 
-	it.Seek([]byte("99999"))
+	found = it.Seek([]byte("99999"))
+	require.False(t, found)
 	require.False(t, it.Valid())
+
+	// Test seek for empty key.
+	it.Add(nil, nil, 0)
+	found = it.Seek(nil)
+	require.True(t, found)
+	require.True(t, it.Valid())
+	require.EqualValues(t, "", it.Value())
+	require.EqualValues(t, 0, it.Meta())
+
+	found = it.Seek([]byte{})
+	require.True(t, found)
+	require.True(t, it.Valid())
+	require.EqualValues(t, "", it.Value())
+	require.EqualValues(t, 0, it.Meta())
 }
 
-func TestIteratorSeekPrev(t *testing.T) {
+func TestIteratorSeekForPrev(t *testing.T) {
 	const n = 100
 	l := NewSkiplist(arenaSize)
 	defer l.DecrRef()
@@ -494,31 +598,52 @@ func TestIteratorSeekPrev(t *testing.T) {
 		v := i*10 + 1000
 		it.Add([]byte(fmt.Sprintf("%05d", i*10+1000)), newValue(v), uint16(v))
 	}
-	it.SeekPrev([]byte(""))
+
+	found := it.SeekForPrev([]byte(""))
+	require.False(t, found)
 	require.False(t, it.Valid())
 
-	it.SeekPrev([]byte("00990"))
+	found = it.SeekForPrev([]byte("00990"))
+	require.False(t, found)
 	require.False(t, it.Valid())
 
-	it.SeekPrev([]byte("01000"))
+	found = it.SeekForPrev([]byte("01000"))
+	require.True(t, found)
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01000", it.Value())
 	require.EqualValues(t, 1000, it.Meta())
 
-	it.SeekPrev([]byte("01005"))
+	found = it.SeekForPrev([]byte("01005"))
+	require.False(t, found)
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01000", it.Value())
 	require.EqualValues(t, 1000, it.Meta())
 
-	it.SeekPrev([]byte("01990"))
+	found = it.SeekForPrev([]byte("01990"))
+	require.True(t, found)
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01990", it.Value())
 	require.EqualValues(t, 1990, it.Meta())
 
-	it.SeekPrev([]byte("99999"))
+	found = it.SeekForPrev([]byte("99999"))
+	require.False(t, found)
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01990", it.Value())
 	require.EqualValues(t, 1990, it.Meta())
+
+	// Test seek for empty key.
+	it.Add(nil, nil, 0)
+	found = it.SeekForPrev(nil)
+	require.True(t, found)
+	require.True(t, it.Valid())
+	require.EqualValues(t, "", it.Value())
+	require.EqualValues(t, 0, it.Meta())
+
+	found = it.SeekForPrev([]byte{})
+	require.True(t, found)
+	require.True(t, it.Valid())
+	require.EqualValues(t, "", it.Value())
+	require.EqualValues(t, 0, it.Meta())
 }
 
 func randomKey(rng *rand.Rand) []byte {
