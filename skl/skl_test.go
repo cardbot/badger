@@ -567,6 +567,15 @@ func TestIteratorSeek(t *testing.T) {
 	require.False(t, found)
 	require.False(t, it.Valid())
 
+	// Test seek for deleted key.
+	it.Seek([]byte("01020"))
+	it.Delete()
+	found = it.Seek([]byte("01020"))
+	require.False(t, found)
+	require.True(t, it.Valid())
+	require.EqualValues(t, "01030", it.Value())
+	require.EqualValues(t, 1030, it.Meta())
+
 	// Test seek for empty key.
 	it.Add(nil, nil, 0)
 	found = it.Seek(nil)
@@ -630,6 +639,15 @@ func TestIteratorSeekForPrev(t *testing.T) {
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01990", it.Value())
 	require.EqualValues(t, 1990, it.Meta())
+
+	// Test seek for deleted key.
+	it.Seek([]byte("01020"))
+	it.Delete()
+	found = it.SeekForPrev([]byte("01020"))
+	require.False(t, found)
+	require.True(t, it.Valid())
+	require.EqualValues(t, "01010", it.Value())
+	require.EqualValues(t, 1010, it.Meta())
 
 	// Test seek for empty key.
 	it.Add(nil, nil, 0)

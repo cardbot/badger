@@ -380,20 +380,22 @@ func (it *Iterator) Prev() {
 func (it *Iterator) Seek(key []byte) (found bool) {
 	var next *node
 	_, next, found = it.seekBaseSplice(key)
-	it.setNode(next, false)
-	return
+	present := it.setNode(next, false)
+	return found && present
 }
 
 func (it *Iterator) SeekForPrev(key []byte) (found bool) {
 	var prev, next *node
 	prev, next, found = it.seekBaseSplice(key)
+
+	var present bool
 	if found {
-		it.setNode(next, true)
+		present = it.setNode(next, true)
 	} else {
-		it.setNode(prev, true)
+		present = it.setNode(prev, true)
 	}
 
-	return
+	return found && present
 }
 
 // Add creates a new key/value record if it does not yet exist and positions the
