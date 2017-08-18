@@ -323,8 +323,8 @@ func TestIteratorSet(t *testing.T) {
 	require.Nil(t, err)
 	err = it2.Set([]byte("00001e"), 600)
 	require.Equal(t, ErrRecordDeleted, err)
-	require.EqualValues(t, "00002", it2.Value())
-	require.EqualValues(t, 500, it.Meta())
+	require.EqualValues(t, "00001d", it2.Value())
+	require.EqualValues(t, 400, it2.Meta())
 
 	require.Equal(t, 1, length(l))
 	require.Equal(t, 1, lengthRev(l))

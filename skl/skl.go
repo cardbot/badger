@@ -497,8 +497,9 @@ func (it *Iterator) Add(key []byte, val []byte, meta uint16) error {
 // Set updates the value of the current iteration record if it has not been
 // updated or deleted since iterating or seeking to it. If the record has been
 // updated, then Set positions the iterator on the most current value and
-// returns ErrRecordUpdated. If the record has been deleted, then Set positions
-// the iterator on the next non-deleted record and returns ErrRecordDeleted.
+// returns ErrRecordUpdated. If the record has been deleted, then Set keeps
+// the iterator positioned on the current record with the current value and
+// returns ErrRecordDeleted.
 func (it *Iterator) Set(val []byte, meta uint16) error {
 	new, err := allocVal(it.arena, val, meta)
 	if err != nil {
@@ -506,11 +507,13 @@ func (it *Iterator) Set(val []byte, meta uint16) error {
 	}
 
 	if !atomic.CompareAndSwapUint64(&it.nd.value, it.value, new) {
-		if it.setNode(it.nd, false) {
-			return ErrRecordUpdated
+		old := atomic.LoadUint64(&it.nd.value)
+		if old == kDeletedVal {
+			return ErrRecordDeleted
 		}
 
-		return ErrRecordDeleted
+		it.value = old
+		return ErrRecordUpdated
 	}
 
 	it.value = new
