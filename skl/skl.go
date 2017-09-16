@@ -508,18 +508,19 @@ func (it *Iterator) Set(val []byte, meta uint16) error {
 		return err
 	}
 
-	if !atomic.CompareAndSwapUint64(&it.nd.value, it.value, new) {
-		old := atomic.LoadUint64(&it.nd.value)
-		if old == kDeletedVal {
-			return ErrRecordDeleted
-		}
+	return it.trySetValue(new)
+}
 
-		it.value = old
-		return ErrRecordUpdated
-	}
-
-	it.value = new
-	return nil
+// SetMeta updates the value of the current iteration record if it has not been
+// updated or deleted since iterating or seeking to it. If the record has been
+// updated, then SetMeta positions the iterator on the most current value and
+// returns ErrRecordUpdated. If the record has been deleted, then SetMeta keeps
+// the iterator positioned on the current record with the current value and
+// returns ErrRecordDeleted.
+func (it *Iterator) SetMeta(meta uint16) error {
+	valOffset, valSize := decodeValue(it.value)
+	new := encodeValue(valOffset, valSize, meta)
+	return it.trySetValue(new)
 }
 
 // Delete marks the current iterator record as deleted from the store if it
@@ -579,6 +580,21 @@ func (it *Iterator) setNode(nd *node, reverse bool) bool {
 	it.value = value
 	it.nd = nd
 	return success
+}
+
+func (it *Iterator) trySetValue(new uint64) error {
+	if !atomic.CompareAndSwapUint64(&it.nd.value, it.value, new) {
+		old := atomic.LoadUint64(&it.nd.value)
+		if old == kDeletedVal {
+			return ErrRecordDeleted
+		}
+
+		it.value = old
+		return ErrRecordUpdated
+	}
+
+	it.value = new
+	return nil
 }
 
 func (it *Iterator) setValueIfDeleted(nd *node, val []byte, meta uint16) error {
